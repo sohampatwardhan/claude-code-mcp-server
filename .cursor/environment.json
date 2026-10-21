@@ -1,0 +1,4 @@
+{
+  "name": "claude-code-mcp-server",
+  "install": "npm ci"
+}
