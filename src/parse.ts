@@ -29,11 +29,35 @@ export const SESSION_URL_REGEX = /https:\/\/claude\.ai\/code(?:\/[^\s"'<>)\]]*)?
 export const SESSION_REF_PATTERN =
   /^(?:(?:session|cse)_[A-Za-z0-9][A-Za-z0-9_-]*|https:\/\/claude\.ai\/code\/[^\s"'<>]+)$/;
 
+/**
+ * Terminal controls that show up in pty transcripts.
+ *
+ * Order matters: a generic ESC-final sequence would otherwise swallow the `[`
+ * of a CSI. CSI parameters include the private bytes `<=>` (`ESC [>4m`,
+ * `ESC [<u`). ESC 7 / ESC 8 (save and restore cursor) are single-byte
+ * escapes, not CSI. C0 bytes other than tab, LF, and CR — SI is 0x0F — are
+ * removed after the escape sequences.
+ */
 // eslint-disable-next-line no-control-regex
-const ANSI_REGEX = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
+const TERMINAL_CONTROL_REGEX = new RegExp(
+  [
+    "\\u001b\\][^\\u0007\\u001b]*(?:\\u0007|\\u001b\\\\)",
+    "\\u001b[P^_][\\s\\S]*?(?:\\u001b\\\\|\\u0007)",
+    "\\u001b\\[[\\x30-\\x3f]*[\\x20-\\x2f]*[\\x40-\\x7e]",
+    "\\u009b[\\x30-\\x3f]*[\\x20-\\x2f]*[\\x40-\\x7e]",
+    "\\u001b[\\x20-\\x2f]*[\\x30-\\x7e]",
+    "[\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f\\u0080-\\u009f]",
+  ].join("|"),
+  "g",
+);
 
 export function stripAnsi(text: string): string {
-  return text.replace(ANSI_REGEX, "");
+  return text.replace(TERMINAL_CONTROL_REGEX, "");
+}
+
+/** Escape-free text with pty `\r` newlines folded into `\n`. */
+export function cleanTerminalText(text: string): string {
+  return stripAnsi(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
 export function findSessionId(text: string): string | null {
@@ -63,7 +87,7 @@ export interface ParsedFollowup {
 }
 
 export function parseCreateOutput(stdout: string): ParsedCreate {
-  const text = stripAnsi(stdout);
+  const text = cleanTerminalText(stdout);
   const json = findJsonObject(text, (o) => "session_id" in o || "url" in o);
 
   const sessionId =
@@ -76,7 +100,7 @@ export function parseCreateOutput(stdout: string): ParsedCreate {
 }
 
 export function parseFollowupOutput(stdout: string): ParsedFollowup {
-  const text = stripAnsi(stdout);
+  const text = cleanTerminalText(stdout);
   const json = findJsonObject(text, (o) => "ok" in o || "session_id" in o);
 
   const sessionId =
@@ -102,7 +126,7 @@ export class AuthParseError extends Error {
 
 /** Parses `claude auth status` JSON. Throws AuthParseError if it is not JSON with a boolean `loggedIn`. */
 export function parseAuthStatus(stdout: string): AuthStatus {
-  const text = stripAnsi(stdout).trim();
+  const text = cleanTerminalText(stdout).trim();
   let value: unknown;
   try {
     value = JSON.parse(text);

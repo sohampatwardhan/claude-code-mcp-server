@@ -61,6 +61,21 @@ describe("parseCreateOutput", () => {
     assert.equal(parsed.title, "Demo");
   });
 
+  it("parses the real pty create transcript, including cursor-save escapes", () => {
+    const stdout =
+      "\u001b7\u001b8Created cloud session: Single-word ok reply\nView: https://claude.ai/code/session_011fxu2EYatr2hHg3jAszFts?from=cli&m=0\nResume with: claude --teleport session_011fxu2EYatr2hHg3jAszFts\n\u000f\u001b[>4m\u001b[<u\u001b7\u001b8";
+    assert.deepEqual(parseCreateOutput(stdout), {
+      session_id: "session_011fxu2EYatr2hHg3jAszFts",
+      session_url: "https://claude.ai/code/session_011fxu2EYatr2hHg3jAszFts?from=cli&m=0",
+      title: "Single-word ok reply",
+      parsed: true,
+    });
+    assert.equal(
+      stripAnsi(stdout),
+      "Created cloud session: Single-word ok reply\nView: https://claude.ai/code/session_011fxu2EYatr2hHg3jAszFts?from=cli&m=0\nResume with: claude --teleport session_011fxu2EYatr2hHg3jAszFts\n",
+    );
+  });
+
   it("accepts cse_ ids", () => {
     const parsed = parseCreateOutput("Session ID: cse_01ABCdefGHIjklMNOpqr\nView: https://claude.ai/code/cse_01ABCdefGHIjklMNOpqr\n");
     assert.equal(parsed.session_id, "cse_01ABCdefGHIjklMNOpqr");
@@ -81,6 +96,23 @@ describe("parseCreateOutput", () => {
       parsed: false,
     });
     assert.deepEqual(parseCreateOutput(""), { session_id: null, session_url: null, title: null, parsed: false });
+  });
+
+  it("parses a transcript that includes the workspace-trust dialog", () => {
+    const stdout = [
+      "Do you trust the files in this folder?",
+      "❯ 1. Yes, I trust this folder",
+      "  2. No, exit",
+      "Created cloud session: Fix flaky login test",
+      `Session ID: ${ID}`,
+      `View: ${URL}`,
+      "",
+    ].join("\n");
+    const parsed = parseCreateOutput(stdout);
+    assert.equal(parsed.session_id, ID);
+    assert.equal(parsed.session_url, URL);
+    assert.equal(parsed.title, "Fix flaky login test");
+    assert.equal(parsed.parsed, true);
   });
 
   it("reports parsed=false when only the id is present", () => {
