@@ -4,6 +4,7 @@ import { z } from "zod";
 
 import { authStatusArgv, createSessionArgv, sendFollowupArgv } from "./argv.js";
 import { ENVIRONMENT_ID_PATTERN, type Config } from "./config.js";
+import { runCliPty, type PtyRunResult } from "./pty.js";
 import {
   AuthParseError,
   SESSION_REF_PATTERN,
@@ -12,6 +13,7 @@ import {
   parseFollowupOutput,
 } from "./parse.js";
 import { RunError, runCli, type RunResult, type Runner } from "./runner.js";
+import { claudeJsonPath, ensureWorkspaceTrusted, isTrustPrompt, resolveTrustProjectPath } from "./trust.js";
 
 export const SERVER_NAME = "claude-code-mcp-server";
 export const SERVER_VERSION = "0.1.0";
@@ -26,7 +28,9 @@ export type ErrorCode =
   | "CLI_SPAWN_FAILED"
   | "CLI_TIMEOUT"
   | "CLI_EXIT_NONZERO"
-  | "OUTPUT_PARSE_FAILED";
+  | "OUTPUT_PARSE_FAILED"
+  | "PTY_UNAVAILABLE"
+  | "WORKSPACE_NOT_TRUSTED";
 
 // ---- schemas -------------------------------------------------------------
 
@@ -133,13 +137,57 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     return result;
   }
 
+  /**
+   * `claude --cloud=<description>` exits immediately unless stdout is a
+   * terminal. Run that argv on a pty. A workspace-trust dialog is refused
+   * unless CLAUDE_MCP_TRUST_CWD is set, in which case Enter is sent once.
+   */
+  async function runCreate(args: string[], projectPath: string): Promise<PtyRunResult | CallToolResult> {
+    let result: PtyRunResult;
+    try {
+      result = await runCliPty(config.claudeBin, args, config.timeoutMs, {
+        pythonBin: config.pythonBin,
+        onOutput: (output) => {
+          if (!isTrustPrompt(output)) return "wait";
+          return config.trustCwd ? "accept" : "refuse";
+        },
+      });
+    } catch (err) {
+      if (err instanceof RunError) return toolError(err.code, err.message, args);
+      throw err;
+    }
+    if (result.trustPrompt === "refused" || (result.trustPrompt !== "accepted" && isTrustPrompt(result.stdout))) {
+      return toolError("WORKSPACE_NOT_TRUSTED", trustMessage(projectPath), args, result);
+    }
+    if (result.timedOut) {
+      return toolError("CLI_TIMEOUT", `claude timed out after ${config.timeoutMs} ms`, args, result);
+    }
+    if (result.exitCode === 127 && result.stdout.includes("claude binary not found:")) {
+      return toolError(
+        "CLI_NOT_FOUND",
+        `claude binary not found: ${config.claudeBin} (set CLAUDE_BIN)`,
+        args,
+        result,
+      );
+    }
+    if (result.exitCode !== 0) {
+      const how = result.exitCode === null ? `was killed by ${result.signal}` : `exited with code ${result.exitCode}`;
+      const detail = result.stderr.trim() || result.stdout.trim();
+      return toolError("CLI_EXIT_NONZERO", `claude ${how}${detail ? `: ${detail}` : ""}`, args, result);
+    }
+    return result;
+  }
+
   server.registerTool(
     "claude_create_cloud_session",
     {
       title: "Create Claude Code cloud session",
       description:
-        "Create a new Claude Code cloud session via `claude --cloud`. Returns the parsed session_id and " +
-        "session_url. If parsing fails, `parsed` is false and the raw CLI output is in `cli`.",
+        "Create a new Claude Code cloud session via `claude --cloud` on a pseudo-terminal (the CLI rejects " +
+        "this form when stdout is a pipe). Returns the parsed session_id and session_url. If parsing fails, " +
+        "`parsed` is false and the raw CLI output is in `cli`. When Claude Code asks to trust the working " +
+        "folder, the call fails with WORKSPACE_NOT_TRUSTED unless CLAUDE_MCP_TRUST_CWD=1, which accepts that " +
+        "dialog for the server's working directory only.",
       inputSchema: createInput,
       outputSchema: createOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -147,7 +195,18 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     async ({ description, environment_id }) => {
       const environmentId = environment_id ?? config.defaultEnvironmentId;
       const args = createSessionArgv(description, environmentId);
-      const result = await run(args);
+      const projectPath = await resolveTrustProjectPath(process.cwd());
+      if (config.trustCwd) {
+        try {
+          // Pre-accept trust for this one directory so the dialog usually never
+          // appears. A corrupt ~/.claude.json is left alone; the pty path can
+          // still answer the dialog because the opt-in is set.
+          ensureWorkspaceTrusted(claudeJsonPath(), projectPath);
+        } catch {
+          // Keystroke fallback below covers a dialog the file edit did not prevent.
+        }
+      }
+      const result = await runCreate(args, projectPath);
       if (!isRunResult(result)) return result;
       const parsed = parseCreateOutput(result.stdout);
       return ok({ ...parsed, environment_id: environmentId, args, cli: cli(result) });
@@ -201,7 +260,19 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
 
 // ---- result helpers ------------------------------------------------------
 
-function isRunResult(value: RunResult | CallToolResult): value is RunResult {
+function trustMessage(projectPath: string): string {
+  const shown = JSON.stringify(projectPath);
+  return (
+    `Claude Code asked to trust ${projectPath} before creating a cloud session. ` +
+    `Set CLAUDE_MCP_TRUST_CWD=1 to let this server accept that dialog for the process working directory only ` +
+    `(the main git checkout when the directory is a repository or worktree). ` +
+    `Accepting trust lets that folder's project hooks and allow rules run. ` +
+    `To trust it yourself, accept the dialog in an interactive claude session, or set ` +
+    `projects[${shown}].hasTrustDialogAccepted to true in ~/.claude.json.`
+  );
+}
+
+function isRunResult(value: RunResult | PtyRunResult | CallToolResult): value is RunResult {
   return "timedOut" in value;
 }
 

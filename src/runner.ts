@@ -14,7 +14,7 @@ export interface RunResult {
   durationMs: number;
 }
 
-export type RunErrorCode = "CLI_NOT_FOUND" | "CLI_SPAWN_FAILED";
+export type RunErrorCode = "CLI_NOT_FOUND" | "CLI_SPAWN_FAILED" | "PTY_UNAVAILABLE";
 
 export class RunError extends Error {
   override name = "RunError";

@@ -83,6 +83,23 @@ describe("parseCreateOutput", () => {
     assert.deepEqual(parseCreateOutput(""), { session_id: null, session_url: null, title: null, parsed: false });
   });
 
+  it("parses a transcript that includes the workspace-trust dialog", () => {
+    const stdout = [
+      "Do you trust the files in this folder?",
+      "❯ 1. Yes, I trust this folder",
+      "  2. No, exit",
+      "Created cloud session: Fix flaky login test",
+      `Session ID: ${ID}`,
+      `View: ${URL}`,
+      "",
+    ].join("\n");
+    const parsed = parseCreateOutput(stdout);
+    assert.equal(parsed.session_id, ID);
+    assert.equal(parsed.session_url, URL);
+    assert.equal(parsed.title, "Fix flaky login test");
+    assert.equal(parsed.parsed, true);
+  });
+
   it("reports parsed=false when only the id is present", () => {
     const parsed = parseCreateOutput(`Session ID: ${ID}\n`);
     assert.equal(parsed.session_id, ID);

@@ -16,6 +16,14 @@ export interface Config {
   defaultEnvironmentId: string | null;
   /** Hard timeout for each spawned CLI process. */
   timeoutMs: number;
+  /**
+   * When true, accept Claude Code's workspace-trust dialog for the process
+   * working directory (the main git checkout when that directory is a
+   * repository or worktree). Off by default.
+   */
+  trustCwd: boolean;
+  /** Python 3 interpreter used to allocate the pty for `claude --cloud`. */
+  pythonBin: string;
 }
 
 export class ConfigError extends Error {
@@ -43,9 +51,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     timeoutMs = Number(rawTimeout);
   }
 
+  const trustCwd = parseBooleanFlag("CLAUDE_MCP_TRUST_CWD", env.CLAUDE_MCP_TRUST_CWD);
+  const pythonBin = (env.CLAUDE_MCP_PYTHON ?? "").trim() || "python3";
+
   return {
     claudeBin,
     defaultEnvironmentId: rawEnvId === "" ? null : rawEnvId,
     timeoutMs,
+    trustCwd,
+    pythonBin,
   };
+}
+
+/** Empty means false. `1` / `true` / `yes` (any case) mean true. */
+function parseBooleanFlag(name: string, raw: string | undefined): boolean {
+  const value = (raw ?? "").trim().toLowerCase();
+  if (value === "" || value === "0" || value === "false" || value === "no") return false;
+  if (value === "1" || value === "true" || value === "yes") return true;
+  throw new ConfigError(`${name} must be 1, true, yes, 0, false, or no, got ${JSON.stringify(raw)}`);
 }

@@ -5,6 +5,11 @@
  */
 
 export function createSessionArgv(description: string, environmentId: string | null): string[] {
+  // `--cloud=<description>` is the create form for Anthropic-hosted and
+  // self-hosted sessions. It requires a terminal; the pty runner supplies one.
+  // The headless alternative `claude -p <task> --environment=<ccpool>` is not
+  // used: it only targets self-hosted pools, and dropping `--cloud=` would let
+  // an older CLI start a local session.
   const argv = [`--cloud=${description}`];
   if (environmentId !== null) argv.push(`--environment=${environmentId}`);
   return assertCloud(argv);
