@@ -12,10 +12,17 @@
 //                          unset    -> create does not ask (folder already trusted)
 //   FAKE_CLAUDE_TRUST_QUESTION
 //                          override the dialog question (default is the long form)
+//   FAKE_TELEPORT_MODE     "fail" exits 1 and writes a teleport error; "silent"
+//                          checks out the branch and writes the debug log with
+//                          no pull-request line; "hang" never exits; unset checks
+//                          out the branch, writes the debug log, and prints a PR
+//                          line when FAKE_TELEPORT_PR_NUMBER and FAKE_TELEPORT_PR_URL are set
+//   FAKE_TELEPORT_BRANCH   branch name to check out (default claude/session-branch)
+//   FAKE_TELEPORT_ERROR    stderr and debug text for fail mode
 //
 // Creating a session (`--cloud=<description>` without `-p`) requires a TTY,
 // matching Claude Code: a piped stdout exits 3 with the interactive-terminal error.
-import { appendFileSync, readFileSync, writeSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
@@ -90,9 +97,46 @@ if (mode === "hang") {
   } else {
     writeCreated();
   }
+} else if (args[0]?.startsWith("--teleport=")) {
+  handleTeleport(args[0].slice("--teleport=".length));
 } else {
   process.stderr.write(`fake-claude: unexpected argv ${JSON.stringify(args)}\n`);
   process.exit(64);
+}
+
+function handleTeleport(session) {
+  const debugArg = args.find((arg) => arg.startsWith("--debug-file="));
+  const debugFile = debugArg === undefined ? "" : debugArg.slice("--debug-file=".length);
+  const teleportMode = process.env.FAKE_TELEPORT_MODE ?? "ok";
+  const branch = process.env.FAKE_TELEPORT_BRANCH ?? "claude/session-branch";
+  if (teleportMode === "hang") {
+    setInterval(() => {}, 1_000);
+    return;
+  }
+  if (teleportMode === "fail") {
+    const line = process.env.FAKE_TELEPORT_ERROR ?? "Teleport in print mode failed: branch not on GitHub";
+    if (debugFile !== "") writeFileSync(debugFile, `${line}\n`);
+    process.stderr.write(`${line}\n`);
+    process.exit(1);
+  }
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-") || branch.includes("..")) {
+    process.stderr.write(`fake-claude: refusing branch ${JSON.stringify(branch)}\n`);
+    process.exit(64);
+  }
+  try {
+    execFileSync("git", ["checkout", "-B", branch], { stdio: "ignore" });
+  } catch {
+    // The debug line still names the branch when this directory is not a checkout.
+  }
+  const logged = `Switching to branch '${branch}'...\nBranch after checkout: '${branch}'\n`;
+  if (debugFile !== "") writeFileSync(debugFile, logged);
+  if (teleportMode !== "silent") {
+    const number = process.env.FAKE_TELEPORT_PR_NUMBER ?? "";
+    const url = process.env.FAKE_TELEPORT_PR_URL ?? "";
+    if (number !== "" && url !== "") process.stdout.write(`Opened PR #${number} ${url}\n`);
+  }
+  process.stdout.write(`teleport ${session}\n`);
+  process.exit(0);
 }
 
 function writeCreated() {
