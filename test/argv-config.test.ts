@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { authStatusArgv, createSessionArgv, sendFollowupArgv } from "../src/argv.js";
+import { authStatusArgv, createSessionArgv, sendFollowupArgv, teleportArgv } from "../src/argv.js";
 import { ConfigError, DEFAULT_TIMEOUT_MS, loadConfig } from "../src/config.js";
 
 const tmp = mkdtempSync(join(tmpdir(), "claude-mcp-config-"));
@@ -33,6 +33,17 @@ describe("argv construction", () => {
 
   it("builds auth argv", () => {
     assert.deepEqual(authStatusArgv(), ["auth", "status"]);
+  });
+
+  it("builds print-mode teleport argv and rejects a non-session id", () => {
+    assert.deepEqual(teleportArgv("session_01ABCDEFGH", "/tmp/claude-mcp/session_01ABCDEFGH.teleport.log"), [
+      "--teleport=session_01ABCDEFGH",
+      "--debug",
+      "--debug-file=/tmp/claude-mcp/session_01ABCDEFGH.teleport.log",
+    ]);
+    assert.throws(() => teleportArgv("--help", "/tmp/x.log"));
+    assert.throws(() => teleportArgv("session_01ABCDEFGH", "relative.log"));
+    assert.throws(() => teleportArgv("https://claude.ai/code/session_01ABCDEFGH", "/tmp/x.log"));
   });
 });
 

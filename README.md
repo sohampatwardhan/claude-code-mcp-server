@@ -2,23 +2,25 @@
 
 MCP server that lets AI agents with an always-on cloud computer (e.g. Muse by Meta, Grok Bot by SpaceXSI, ChatGPT Dots by OpenAI, etc) orchestrate Claude Code cloud sessions natively via the Claude Code CLI.
 
-It exposes three tools over stdio: create a cloud session, queue a follow-up message into one, and check the CLI's sign-in state. Each tool maps to one fixed `claude` invocation, and each returns structured JSON. Agents call typed tools and get typed results back, so they never need to write shell commands.
+It exposes four tools over stdio: create a cloud session, queue a follow-up message into one, read the GitHub branch and pull request a session produced, and check the CLI's sign-in state. Each tool maps to one fixed `claude` invocation, and each returns structured JSON. Agents call typed tools and get typed results back, so they never need to write shell commands.
 
 ## Design
 
 - **Strict input schemas.** Every field is typed, required fields are listed explicitly, and every schema sets `additionalProperties: false`. Invalid input is rejected by schema validation before any process is spawned.
-- **No escape hatch.** The tool surface is exactly the three tools below. There is no "run any claude command" tool and no shell access.
+- **No escape hatch.** The tool surface is exactly the four tools below. There is no "run any claude command" tool and no shell access.
 - **Deterministic argv.** Arguments are built from validated inputs in a fixed order and passed as an array (`shell: false`). Values are attached as `--flag=value`, or placed after `--`, so a value that starts with `-` can never be read as a flag. `claude --cloud=<description>` is executed on a pseudo-terminal because the CLI rejects that form when stdout is a pipe; the pty helper `exec`s the same argv and never goes through a shell.
 - **Structured outputs.** Every tool declares an `outputSchema` and returns `structuredContent` with parsed fields, such as `session_id` and `session_url`. CLI stdout and stderr are returned in `cli` with terminal control sequences removed.
-- **Cloud only.** The session tools always pass `--cloud`. The server never starts a local Claude Code session.
-- **No network of its own, no telemetry.** It only runs the local `claude` binary. The one exception is `git clone` and `git fetch` for a github.com repository named on `CLAUDE_MCP_REPOS`, into a cache directory this server owns.
+- **Cloud sessions.** Create and follow-up always pass `--cloud=`. Session status runs print-mode `claude --teleport=<session>` inside the server's cache so the CLI can check out the branch the cloud session pushed, then the process exits. That argv carries no prompt and is not attached to a terminal.
+- **No telemetry.** The server runs the local `claude` binary. Its own network calls are `git clone` / `git fetch` of a validated `https://github.com/owner/name.git` into the cache, and a read-only `gh pr list` when status needs a pull request number.
 
 ## Prerequisites
 
 - Node.js 20 or later
 - The [Claude Code CLI](https://code.claude.com/docs), installed and signed in (`claude auth status` should report `"loggedIn": true`), with cloud sessions available on your account
-- Python 3 (the standard library only: `pty`, `fcntl`, `termios`) for `claude_create_cloud_session`. No pip packages. Follow-ups and auth status do not need Python. On Debian/Ubuntu this is the `python3` package, which is usually already installed.
-- Git, when a call selects a github.com repository from `CLAUDE_MCP_REPOS`. The server runs `git` with a fixed argument list. Directory entries on that list do not need a separate clone.
+- Python 3 (the standard library only: `pty`, `fcntl`, `termios`) for `claude_create_cloud_session`. No pip packages. Follow-ups, session status, and auth status do not need Python. On Debian/Ubuntu this is the `python3` package, which is usually already installed.
+- Git on `PATH`, when a call names a github.com repository. The server runs `git` with a fixed argument list and `core.hooksPath=/dev/null`.
+- The Claude GitHub app installed on each private repository the cloud VM should clone, push, or open a pull request in. Public repositories can be cloned once the claude.ai account is connected to GitHub. See [GitHub access](#github-access) below.
+- The [`gh`](https://cli.github.com/) CLI, signed in, when session status should resolve a pull request that teleport's output does not already name. The branch is still returned when `gh` is absent.
 
 ## Install and build
 
@@ -48,8 +50,8 @@ The server speaks MCP over stdin/stdout. Normally the MCP client launches it, so
 | `CLAUDE_MCP_TRUST_CWD` | unset (off) | `1`, `true`, or `yes` lets create accept Claude Code's workspace-trust dialog for `CLAUDE_MCP_CWD` only (the process working directory when that is unset). `0`, `false`, `no`, or unset leaves the dialog unanswered and the call fails with `WORKSPACE_NOT_TRUSTED`. |
 | `CLAUDE_MCP_PYTHON` | `python3` | Python 3 interpreter used to allocate the pseudo-terminal for create. |
 | `CLAUDE_MCP_CWD` | process working directory | Directory the CLI runs in when a call omits `repo`. `claude --cloud` packages this tree, and workspace trust is resolved from it. A relative path is resolved at startup. The path must exist and be a directory. |
-| `CLAUDE_MCP_REPOS` | empty | Comma-separated allowlist of repositories a create call may select. Each entry is an absolute directory that exists at startup, or a github.com `owner/name` (a `https://github.com/owner/name` URL is stored as the slug). Anything else is rejected at startup. |
-| `CLAUDE_MCP_REPO_CACHE` | `~/.claude-mcp/repos` | Directory that holds checkouts of allowlisted GitHub repositories. Created on first use. An existing path must be a directory. |
+| `CLAUDE_MCP_REPOS` | empty | Comma-separated allowlist of local directories a create call may select. Each entry is an absolute directory that exists at startup. A github.com `owner/name` is accepted and ignored for access control: any github.com repository can be cloned into the cache. Other hosts, relative paths, and missing directories are rejected at startup. |
+| `CLAUDE_MCP_REPO_CACHE` | `~/.claude-mcp/repos` | Directory that holds checkouts of GitHub repositories named by a call. Created on first use. An existing path must be a directory. This directory is the allowlist for where clones are written. |
 
 If any of these values is invalid, the server exits at startup with code 2 and prints a message on stderr.
 
@@ -57,13 +59,36 @@ When a create call omits `repo`, the CLI runs in `CLAUDE_MCP_CWD`, or in the ser
 
 ### Choosing a repository per call
 
-`claude --cloud` has no flag for a repository URL. The repository is whichever checkout the command runs in ([Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web)). Create accepts an optional `repo` so one connector can start sessions in more than one place. The value has to be on `CLAUDE_MCP_REPOS`:
+`claude --cloud` has no flag for a repository URL. The repository is whichever checkout the command runs in, and the cloud VM clones that directory's GitHub remote at the current branch ([Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web)). The web UI can pick a repository and base branch directly; the CLI cannot, so this server prepares the checkout:
 
-- An absolute directory on the list is used as the CLI working directory. The server does not fetch, reset, or otherwise modify that checkout.
-- A github.com `owner/name` on the list (or the same repository written as `https://github.com/owner/name`) is cloned into `CLAUDE_MCP_REPO_CACHE/<owner>/<name>` with `git clone https://github.com/<owner>/<name>.git`. Later calls fetch and reset that cache checkout to the remote's default branch, and remove untracked files there. A cache directory whose `origin` is a different URL is left unchanged and the call fails. Private repositories use whatever credential helper `git` already has. The server does not read tokens from the tool arguments.
-- Any other value, including a subdirectory of an allowlisted directory, a relative path, or a repository that is not on the list, fails with `REPO_NOT_ALLOWED` and the CLI is not started. A clone or fetch failure fails with `REPO_PREPARE_FAILED`.
+- A github.com `owner/name` (or `https://github.com/owner/name`) needs no local checkout and does not have to be listed in `CLAUDE_MCP_REPOS`. The server clones it into `CLAUDE_MCP_REPO_CACHE/<owner>/<name>` from `https://github.com/<owner>/<name>.git`, sets `origin` to that URL, fetches, and checks out `base_branch` when the call sets one. Omitting `base_branch` checks out the remote's default branch. Later calls fetch again and reset that cache checkout, including removing untracked files there. A cache directory whose `origin` is a different repository is left unchanged and the call fails. `base_branch` must already exist on `origin`.
+- An absolute directory on `CLAUDE_MCP_REPOS` is used as the CLI working directory. The server does not fetch, reset, or otherwise modify that checkout, and `base_branch` is rejected for it.
+- Any other value, including a subdirectory of an allowlisted directory, a relative path, another host, or a URL with a token, fails before the CLI starts (`REPO_NOT_ALLOWED`). A clone, fetch, or missing-branch failure is `REPO_PREPARE_FAILED`.
+
+The clone URL is built by the server. Tool arguments cannot name a host, a credential, or a refspec. Private clones use whatever credential helper `git` already has on this machine; that credential is what lets the *local* cache see the repository. It is not uploaded, and it is not what the cloud VM uses to push.
 
 Workspace trust follows the directory that was selected. With `CLAUDE_MCP_TRUST_CWD=1`, the opt-in writes the trust flag for that directory's main git checkout (or the directory itself when it is not a repository) and answers the dialog only for that folder.
+
+### GitHub access
+
+Two different GitHub identities are involved. They are easy to mix up because both end up talking about the same `owner/name`.
+
+**Claude Code's GitHub integration** is what the cloud virtual machine uses. From [Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web) and the [web quickstart](https://code.claude.com/docs/en/web-quickstart):
+
+- The VM clones the GitHub remote of the directory `--cloud` was started in, at that directory's current branch. It does not upload the local tree when that remote can be cloned. Push local commits first if the VM should see them; this server's cache is reset to the remote, so the branch on GitHub is what the VM clones.
+- Connecting the claude.ai account to GitHub lets a cloud session clone public repositories. Private repositories need the Claude GitHub app installed on that repository (repository settings, or the install URL Claude shows). The app is also required for auto-fix and for Projects.
+- `/web-setup` in a local Claude Code session stores the machine's `gh` token on the claude.ai account. Cloud sessions can then use any repository that token can access. The app is still required for auto-fix.
+- Each cloud task gets its own session and its own branch. After the branch is pushed, the session opens a pull request with `gh pr create` inside the cloud conversation. This server does not call the GitHub API to open a pull request.
+- The browser repository-and-branch picker is not available on the CLI. `base_branch` plus the cache checkout is how a CLI caller selects them.
+
+**This server** only makes the local `claude --cloud` see the right remote and branch, then reads the artifacts back:
+
+- `git clone` / `git fetch` / `git checkout` in `CLAUDE_MCP_REPO_CACHE`, with hooks disabled and submodules not checked out.
+- `claude --teleport=<session> --debug --debug-file=<cache>/sessions/<session>.teleport.log`, stdin closed, stdout a pipe. On Claude Code 2.1.300, print mode validates the session, checks out the branch the session pushed, logs `Branch after checkout: '<name>'`, and exits. It does not open a local interactive session. The debug file is required: without `--debug` that line is not emitted, and a signed-out print-mode teleport exits with empty stdout and stderr.
+- `git symbolic-ref HEAD` after teleport, used when it disagrees with the pre-teleport branch.
+- `gh pr list --repo owner/name --head <branch> --json number,url --limit 1` when the teleport output did not include a pull request URL. That reads the pull request the cloud session already opened.
+
+Teleport has to run in a checkout of the same repository (not a fork) with a clean work tree. The server runs it only in the cache, after a clean reset. It is never run in a directory from `CLAUDE_MCP_REPOS`. A session that has not pushed a branch yet fails teleport; status then returns `CLI_EXIT_NONZERO` and no branch. `claude --resume`, `claude logs`, and `claude agents` list local sessions, and `claude -p --cloud <session>` only queues a follow-up ([CLI reference](https://code.claude.com/docs/en/cli-reference), [sessions](https://code.claude.com/docs/en/sessions), [headless](https://code.claude.com/docs/en/headless)). None of those report the pushed branch or the pull request.
 
 ### Workspace trust
 
@@ -100,14 +125,15 @@ Input schema:
   "properties": {
     "description": { "type": "string", "minLength": 1, "maxLength": 100000, "pattern": "\\S" },
     "environment_id": { "type": "string", "maxLength": 200, "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$" },
-    "repo": { "type": "string", "minLength": 1, "maxLength": 4096 }
+    "repo": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "base_branch": { "type": "string", "minLength": 1, "maxLength": 255 }
   },
   "required": ["description"],
   "additionalProperties": false
 }
 ```
 
-The environment id is chosen in this order: `environment_id` from the call, then `CLAUDE_CLOUD_ENVIRONMENT_ID`, then none (no `--environment` flag). `repo` matches an absolute path, a github.com `owner/name`, or a `https://github.com/owner/name` URL, and it has to be on `CLAUDE_MCP_REPOS`. Omit `repo` to use the default directory; the output field is then `null`. When `repo` is set, `cwd` is the directory the CLI ran in and `repo` is the normalized value (`owner/name`, or the canonical directory path).
+The environment id is chosen in this order: `environment_id` from the call, then `CLAUDE_CLOUD_ENVIRONMENT_ID`, then none (no `--environment` flag). `repo` matches an absolute path, a github.com `owner/name`, or a `https://github.com/owner/name` URL. A github.com value is cloned into the cache; an absolute path has to be on `CLAUDE_MCP_REPOS`. Omit `repo` to use the default directory; the output field is then `null`. When `repo` is set, `cwd` is the directory the CLI ran in and `repo` is the normalized value (`owner/name`, or the canonical directory path). `base_branch` is the branch checked out in the cache before `--cloud` runs. It is `null` in the output when the call did not name a github.com repository. For a GitHub repository it is the requested branch, or the remote default branch when the call omitted it.
 
 Output:
 
@@ -120,6 +146,7 @@ Output:
   "environment_id": null,
   "cwd": "/absolute/path/to/the/repo",
   "repo": "owner/name",
+  "base_branch": "main",
   "args": ["--cloud=Fix flaky login test"],
   "cli": { "exit_code": 0, "stdout": "Created cloud session: ...", "stderr": "" }
 }
@@ -165,16 +192,55 @@ Output:
 
 `sent` is `true` when the CLI confirmed delivery (`Sent to cloud session.`).
 
-### Session progress
+### `claude_get_session`
 
-There is no supported way for this server to read a cloud session's status or latest assistant message, so it does not expose a `claude_get_session` tool. Callers open `session_url`.
+Session status for the GitHub artifacts of a cloud session: the branch it pushed, and the pull request URL and number when one exists. Runs, with stdin closed and stdout a pipe:
 
-The current CLI documents these related commands, and none of them is a read of a claude.ai cloud session:
+`claude --teleport=<session_id> --debug --debug-file=<cache>/sessions/<session_id>.teleport.log`
 
-- [`claude -p --cloud <session>`](https://code.claude.com/docs/en/claude-code-on-the-web) queues one message and exits. It does not wait for a reply. `--output-format json` on that command returns `{ok, session_id, url}` (or `{ok: false, session_id, error}`), and `--output-format stream-json` is not supported with `--cloud`. The same page says to open the session on claude.ai to check progress. The [CLI reference](https://code.claude.com/docs/en/cli-reference) (also published at [docs.claude.com](https://docs.claude.com/en/docs/claude-code/cli-reference)) describes `--cloud` the same way: a task description creates a session, and a session id with `-p` queues a message.
-- [`claude --teleport <session>`](https://code.claude.com/docs/en/claude-code-on-the-web) resumes the cloud session in a local terminal. It fetches and checks out the session's branch, prompts to stash uncommitted changes, and loads the conversation into a local session whose later work stays on that machine. That modifies a checkout and starts a local Claude Code session, so it is not a safe read of status or of the latest cloud reply.
-- [`claude --resume`](https://code.claude.com/docs/en/sessions), `claude logs`, and `claude agents --json` address local and background sessions stored on this machine. [Manage sessions](https://code.claude.com/docs/en/sessions) says the desktop app, claude.ai/code, and the CLI each keep their own session list, and the cloud-sessions page says `--resume` does not list cloud sessions. `/export` renders the conversation of a local CLI session. [Headless](https://code.claude.com/docs/en/headless) `--output-format json` is the result of a local `claude -p` run.
-- [`--remote`](https://code.claude.com/docs/en/cli-reference) is a deprecated alias of `--cloud`. `--remote-control` steers a local session from another device. Neither reports a cloud session's messages.
+in the cache checkout of the session's repository. The process is killed if it exceeds `CLAUDE_MCP_TIMEOUT_MS`. No follow-up text is sent.
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "session": {
+      "type": "string",
+      "maxLength": 2000,
+      "pattern": "^(?:(?:session|cse)_[A-Za-z0-9][A-Za-z0-9_-]*|https:\\/\\/claude\\.ai\\/code\\/[^\\s\"'<>]+)$"
+    },
+    "repo": { "type": "string", "minLength": 1, "maxLength": 4096 }
+  },
+  "required": ["session"],
+  "additionalProperties": false
+}
+```
+
+`repo` is a github.com `owner/name` or `https://github.com/owner/name` URL. Omit it when `claude_create_cloud_session` created this session with a github.com `repo`: that slug and base branch are stored under the cache. A session created from a local directory has no record; pass `repo` then. Passing `repo` selects that repository even when a record exists. When the slug matches the record, the recorded base branch is checked out before teleport so the cache is clean.
+
+Output:
+
+```json
+{
+  "session_id": "session_01AbC...",
+  "repo": "owner/name",
+  "branch": "claude/add-retry",
+  "base_branch": "main",
+  "pr_number": 17,
+  "pr_url": "https://github.com/owner/name/pull/17",
+  "pr_source": "gh",
+  "pr_error": null,
+  "parsed": true,
+  "args": ["--teleport=session_01AbC...", "--debug", "--debug-file=/.../sessions/session_01AbC....teleport.log"],
+  "cli": { "exit_code": 0, "stdout": "", "stderr": "Branch after checkout: 'claude/add-retry'" }
+}
+```
+
+`parsed` is true when `branch` was identified. `branch` is null when teleport exits 0 without moving HEAD off the base branch and without logging a checkout. `pr_number` and `pr_url` are null when the branch has no pull request. `pr_source` is `output` when teleport's text included the pull request, `gh` when `gh pr list` supplied it, and null when neither did. `pr_error` is set when `gh` is missing or fails; an empty pull-request list leaves `pr_error` null.
+
+This tool does not return the assistant's latest reply. Open `session_url` from create for the conversation. `claude -p --cloud <session>` queues a message and exits; `--output-format stream-json` is not supported with `--cloud` ([cloud sessions](https://code.claude.com/docs/en/claude-code-on-the-web), [CLI reference](https://code.claude.com/docs/en/cli-reference), also at [docs.claude.com](https://docs.claude.com/en/docs/claude-code/cli-reference)). `--resume`, `claude logs`, and `claude agents --json` address local sessions ([sessions](https://code.claude.com/docs/en/sessions)). `--remote` is a deprecated alias of `--cloud`.
 
 On a self-hosted environment a Stop hook on the runner can capture replies (see [Test self-hosted environments](https://code.claude.com/docs/en/self-hosted-environments-testing)). That hook runs on the runner, outside this server.
 
@@ -225,8 +291,9 @@ Failures come back as MCP tool errors (`isError: true`). The text content block 
 | `OUTPUT_PARSE_FAILED` | `claude auth status` did not print JSON with a boolean `loggedIn`. |
 | `PTY_UNAVAILABLE` | Create could not start the Python interpreter that allocates the pseudo-terminal (`CLAUDE_MCP_PYTHON`). `cli` is `null`. |
 | `WORKSPACE_NOT_TRUSTED` | Create reached Claude Code's workspace-trust dialog and `CLAUDE_MCP_TRUST_CWD` is off, so the dialog was not answered. |
-| `REPO_NOT_ALLOWED` | `repo` is missing from `CLAUDE_MCP_REPOS`, or it is not an absolute directory or a github.com `owner/name`. The CLI is not started. |
-| `REPO_PREPARE_FAILED` | Preparing the allowlisted GitHub checkout failed (git missing, clone or fetch error, lock timeout, or the cache directory has a different `origin`). |
+| `REPO_NOT_ALLOWED` | `repo` is not an absolute directory on `CLAUDE_MCP_REPOS` and not a github.com `owner/name`. The CLI is not started. |
+| `REPO_PREPARE_FAILED` | Preparing the GitHub cache checkout failed (git missing, clone or fetch error, `base_branch` missing on origin, `base_branch` passed for a local directory, lock timeout, or the cache directory has a different `origin`). |
+| `SESSION_REPO_UNKNOWN` | Session status was called without `repo` and this server has no record of a github.com repository for that session. |
 
 Schema violations (a missing required field, an unknown property, a value that doesn't match a pattern) are rejected by the MCP SDK's input validation as tool errors, and the CLI is never run.
 
@@ -246,7 +313,8 @@ The server uses standard MCP stdio, so any client that accepts an `mcpServers`-s
       "env": {
         "CLAUDE_BIN": "claude",
         "CLAUDE_MCP_TIMEOUT_MS": "300000",
-        "CLAUDE_MCP_REPOS": "/absolute/path/to/a/local/checkout,owner/name"
+        "CLAUDE_MCP_REPOS": "/absolute/path/to/a/local/checkout",
+        "CLAUDE_MCP_REPO_CACHE": "/absolute/path/to/the/github/cache"
       }
     }
   }
@@ -302,19 +370,20 @@ src/
   index.ts    entry point (bin): loads config, starts the stdio server
   server.ts   tool definitions, input/output schemas, error shape
   argv.ts     deterministic argv construction for each tool
-  repos.ts    allowlisted per-call directory and GitHub checkout cache
-  parse.ts    CLI output parsing (session id / URL regexes, auth JSON)
-  runner.ts   child_process spawn with timeout and output caps (follow-up and auth)
+  repos.ts    per-call directory, GitHub checkout cache, session record, gh pr list
+  parse.ts    CLI output parsing (session id / URL regexes, teleport branch and PR, auth JSON)
+  runner.ts   child_process spawn with timeout and output caps (follow-up, session status, and auth)
   pty.ts      pseudo-terminal spawn used by create (embedded Python helper)
   trust.ts    workspace-trust dialog detection and the opt-in ~/.claude.json edit
   config.ts   environment variable parsing and validation
 test/
   parse.test.ts        parser unit tests against realistic CLI output
   argv-config.test.ts  argv and config unit tests
-  repos.test.ts        allowlist, path checks, and the GitHub checkout cache
+  repos.test.ts        allowlist, path checks, GitHub cache, and base branch
   trust.test.ts        trust-dialog detection, ~/.claude.json edits, worktree path
   smoke.test.ts        starts the built server over stdio and exercises every tool
-  fixtures/fake-claude.mjs  stand-in CLI used by the smoke test (TTY and trust dialog)
+  fixtures/fake-claude.mjs  stand-in CLI used by the smoke test (TTY, trust dialog, teleport)
+  fixtures/fake-gh.mjs      stand-in gh used when session status looks up a pull request
 ```
 
 ## License

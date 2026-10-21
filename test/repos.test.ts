@@ -8,6 +8,7 @@ import { after, describe, it } from "node:test";
 import {
   RepoNotAllowedError,
   RepoPrepareError,
+  classifyCreateRequest,
   githubCacheDir,
   githubCloneUrl,
   parseAllowlist,
@@ -67,7 +68,7 @@ describe("resolveCreateDirectory", () => {
         cacheRoot: join(tmp, "cache"),
         timeoutMs: 5_000,
       }),
-      { cwd: dir, repo: null },
+      { cwd: dir, repo: null, baseBranch: null, github: null },
     );
   });
 
@@ -81,6 +82,8 @@ describe("resolveCreateDirectory", () => {
     });
     assert.equal(selected.cwd, realpathSync(dir));
     assert.equal(selected.repo, realpathSync(dir));
+    assert.equal(selected.baseBranch, null);
+    assert.equal(selected.github, null);
 
     const child = join(dir, "nested");
     mkdirSync(child);
@@ -95,41 +98,63 @@ describe("resolveCreateDirectory", () => {
         }),
       RepoNotAllowedError,
     );
-    await assert.rejects(
-      () =>
-        resolveCreateDirectory({
-          requested: "https://github.com/other/repo",
-          defaultCwd: dir,
-          allowlist,
-          cacheRoot: join(tmp, "cache"),
-          timeoutMs: 5_000,
-        }),
-      RepoNotAllowedError,
-    );
-    await assert.rejects(
-      () =>
-        resolveCreateDirectory({
-          requested: "acme/widgets",
-          defaultCwd: dir,
-          allowlist: parseAllowlist(dir),
-          cacheRoot: join(tmp, "unused-cache"),
-          timeoutMs: 5_000,
-        }),
-      RepoNotAllowedError,
-    );
   });
 
-  it("normalizes a github.com URL to the allowlisted slug without cloning when the slug is absent", async () => {
-    await assert.rejects(
+  it("clones a github.com slug that is not on the allowlist and checks out base_branch", async () => {
+    const origin = join(tmp, "acme-widgets.git");
+    const work = join(tmp, "acme-widgets-src");
+    mkdirSync(work, { recursive: true });
+    git(["init", "-b", "main", work]);
+    writeFileSync(join(work, "README"), "main\n");
+    git(["add", "README"], work);
+    git(["commit", "-m", "main"], work);
+    git(["checkout", "-b", "develop"], work);
+    writeFileSync(join(work, "README"), "develop\n");
+    git(["commit", "-am", "develop"], work);
+    git(["clone", "--bare", work, origin]);
+    const cache = join(tmp, "any-github");
+    const previousGlobal = process.env.GIT_CONFIG_GLOBAL;
+    const previousNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+    const gitconfig = join(tmp, "gitconfig-acme");
+    writeFileSync(gitconfig, `[url "${origin}"]\n\tinsteadOf = https://github.com/acme/widgets.git\n`);
+    process.env.GIT_CONFIG_GLOBAL = gitconfig;
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    try {
+      const selected = await resolveCreateDirectory({
+        requested: "https://github.com/acme/widgets.git",
+        baseBranch: "develop",
+        defaultCwd: dir,
+        allowlist: [],
+        cacheRoot: cache,
+        timeoutMs: 20_000,
+      });
+      assert.equal(selected.repo, "acme/widgets");
+      assert.equal(selected.baseBranch, "develop");
+      assert.equal(selected.github?.slug, "acme/widgets");
+      assert.equal(readFileSync(join(selected.cwd, "README"), "utf8"), "develop\n");
+      const stored = execFileSync("git", ["config", "--get", "remote.origin.url"], {
+        cwd: selected.cwd,
+        encoding: "utf8",
+      }).trim();
+      assert.equal(stored, "https://github.com/acme/widgets.git");
+    } finally {
+      if (previousGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = previousGlobal;
+      if (previousNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+      else process.env.GIT_CONFIG_NOSYSTEM = previousNoSystem;
+    }
+  });
+
+  it("refuses base_branch for a local directory without checking out a branch", () => {
+    assert.throws(
       () =>
-        resolveCreateDirectory({
-          requested: "https://github.com/acme/widgets.git",
+        classifyCreateRequest({
+          requested: dir,
+          baseBranch: "develop",
           defaultCwd: dir,
-          allowlist: [],
-          cacheRoot: join(tmp, "no-clone"),
-          timeoutMs: 5_000,
+          allowlist: parseAllowlist(dir),
         }),
-      (err: unknown) => err instanceof RepoNotAllowedError && err.message.includes("acme/widgets"),
+      RepoPrepareError,
     );
   });
 });
@@ -156,7 +181,7 @@ describe("syncCachedCheckout", () => {
     git(["clone", "--bare", work, origin]);
     git(["remote", "add", "origin", origin], work);
 
-    await syncCachedCheckout(dest, origin, 20_000);
+    assert.equal(await syncCachedCheckout(dest, origin, 20_000), "main");
     assert.equal(readFileSync(join(dest, "README"), "utf8"), "one\n");
 
     writeFileSync(join(dest, "README"), "dirty\n");
@@ -189,5 +214,27 @@ describe("syncCachedCheckout", () => {
 
     await assert.rejects(() => syncCachedCheckout(dest, second, 20_000), RepoPrepareError);
     assert.equal(readFileSync(join(dest, "README"), "utf8"), "keep\n");
+  });
+
+  it("rejects a missing base branch and leaves the checkout on its current branch", async () => {
+    const work = join(tmp, "base-src");
+    const origin = join(tmp, "base.git");
+    const dest = join(tmp, "base-cache");
+    mkdirSync(work);
+    git(["init", "-b", "main", work]);
+    writeFileSync(join(work, "README"), "base\n");
+    git(["add", "README"], work);
+    git(["commit", "-m", "base"], work);
+    git(["clone", "--bare", work, origin]);
+    await syncCachedCheckout(dest, origin, 20_000);
+    await assert.rejects(
+      () => syncCachedCheckout(dest, origin, 20_000, "feature/missing"),
+      (err: unknown) => err instanceof RepoPrepareError && err.message.includes("feature/missing"),
+    );
+    assert.equal(
+      execFileSync("git", ["symbolic-ref", "--short", "HEAD"], { cwd: dest, encoding: "utf8" }).trim(),
+      "main",
+    );
+    await assert.rejects(() => syncCachedCheckout(dest, origin, 20_000, "a/../../b"), RepoPrepareError);
   });
 });

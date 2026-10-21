@@ -9,6 +9,7 @@ import {
   parseAuthStatus,
   parseCreateOutput,
   parseFollowupOutput,
+  parseTeleportOutput,
   stripAnsi,
 } from "../src/parse.js";
 
@@ -226,6 +227,49 @@ describe("parseAuthStatus", () => {
     assert.throws(() => parseAuthStatus("Not logged in"), AuthParseError);
     assert.throws(() => parseAuthStatus('{"email": "x"}'), AuthParseError);
     assert.throws(() => parseAuthStatus("[]"), AuthParseError);
+  });
+});
+
+describe("parseTeleportOutput", () => {
+  const repo = { owner: "acme", name: "widgets" };
+
+  it("reads the branch line Claude Code 2.1.300 logs and a pull request URL", () => {
+    const text = [
+      "Switching to branch 'claude/session-branch'...",
+      "Branch after checkout: 'claude/session-branch'",
+      "Opened PR #17 https://github.com/acme/widgets/pull/17",
+    ].join("\n");
+    assert.deepEqual(parseTeleportOutput(text, repo), {
+      branch: "claude/session-branch",
+      pr_number: 17,
+      pr_url: "https://github.com/acme/widgets/pull/17",
+      notes: [
+        "Switching to branch 'claude/session-branch'...",
+        "Branch after checkout: 'claude/session-branch'",
+      ],
+    });
+  });
+
+  it("ignores a pull request for a different repository and an unsafe branch", () => {
+    const text = [
+      "Branch after checkout: 'feature/../../etc'",
+      "Opened PR #4 https://github.com/other/repo/pull/4",
+      "something unexpected happened",
+    ].join("\n");
+    assert.deepEqual(parseTeleportOutput(text, repo), {
+      branch: null,
+      pr_number: null,
+      pr_url: null,
+      notes: ["Branch after checkout: 'feature/../../etc'"],
+    });
+  });
+
+  it("keeps a print-mode failure line and does not invent a branch", () => {
+    const text = "Teleport in print mode failed: Cloud sessions need a claude.ai sign-in\n";
+    const parsed = parseTeleportOutput(text, repo);
+    assert.equal(parsed.branch, null);
+    assert.equal(parsed.pr_number, null);
+    assert.deepEqual(parsed.notes, ["Teleport in print mode failed: Cloud sessions need a claude.ai sign-in"]);
   });
 });
 

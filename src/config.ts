@@ -34,9 +34,13 @@ export interface Config {
    * packages this tree, and workspace trust is keyed from it.
    */
   cwd: string;
-  /** Absolute directories and github.com repositories a call may select. */
+  /**
+   * Absolute directories a create call may select. github.com owner/name
+   * entries are accepted here for compatibility and are not required: any
+   * github.com repository may be cloned into `repoCache`.
+   */
   repos: AllowEntry[];
-  /** Directory that holds checkouts of allowlisted GitHub repositories. */
+  /** Directory that holds checkouts of GitHub repositories named by a call. */
   repoCache: string;
 }
 
