@@ -2,7 +2,7 @@
 // CLAUDE_BIN pointed at a fake CLI so no real sessions are created.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
@@ -73,6 +73,12 @@ async function connect(extraEnv: Record<string, string> = {}) {
   return { client, argvCalls, metaCalls, stdinBytes, close: () => client.close() };
 }
 
+function mkdirWork(name: string): string {
+  const dir = join(tmp, name);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 /** Directory the server will mark trusted for `dir`: main checkout, else `dir`. */
 function expectedTrustPath(dir: string = process.cwd()): string {
   try {
@@ -138,6 +144,8 @@ describe("stdio smoke test", () => {
       assert.equal(s.title, "Fix the flaky test");
       assert.equal(s.parsed, true);
       assert.equal(s.environment_id, null);
+      assert.equal(s.cwd, process.cwd());
+      assert.equal(s.repo, null);
       const cli = s.cli as { stdout: string; stderr: string };
       assert.equal(cli.stderr, "");
       assert.doesNotMatch(cli.stdout, /[\u0000-\u0008\u000e-\u001f]/);
@@ -229,6 +237,8 @@ describe("stdio smoke test", () => {
         { name: "claude_create_cloud_session", arguments: { description: "x", extra: 1 } },
         { name: "claude_create_cloud_session", arguments: { description: "   " } },
         { name: "claude_create_cloud_session", arguments: { description: "x", environment_id: "--bad" } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", repo: "not a repo" } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", repo: "https://gitlab.com/acme/widgets" } },
         { name: "claude_send_followup", arguments: { session: "--help", message: "hi" } },
         { name: "claude_send_followup", arguments: { session: "session_01ABCDEFGH" } },
         { name: "claude_auth_status", arguments: { verbose: true } },
@@ -321,6 +331,69 @@ describe("stdio smoke test", () => {
       assert.equal(errorBody(created).error.code, "PTY_UNAVAILABLE");
       const auth = (await client.callTool({ name: "claude_auth_status", arguments: {} })) as CallToolResult;
       assert.notEqual(auth.isError, true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("runs create in an allowlisted directory and rejects anything off the list", async () => {
+    const work = realpathSync(mkdirWork("allowed-repo"));
+    const outsider = realpathSync(mkdirWork("outsider"));
+    const { client, argvCalls, metaCalls, close } = await connect({
+      CLAUDE_MCP_REPOS: work,
+    });
+    try {
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "in the allowlisted checkout", repo: work },
+      })) as CallToolResult;
+      assert.notEqual(created.isError, true);
+      const s = created.structuredContent as { cwd: string; repo: string; title: string };
+      assert.equal(s.cwd, work);
+      assert.equal(s.repo, work);
+      assert.equal(s.title, "in the allowlisted checkout");
+      assert.equal(metaCalls()[0]?.cwd, work);
+
+      const denied = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "nope", repo: outsider },
+      })) as CallToolResult;
+      assert.equal(errorBody(denied).error.code, "REPO_NOT_ALLOWED");
+      const unknown = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "nope", repo: "sohampatwardhan/141-hillside-1b-hub" },
+      })) as CallToolResult;
+      assert.equal(errorBody(unknown).error.code, "REPO_NOT_ALLOWED");
+      assert.deepEqual(argvCalls(), [["--cloud=in the allowlisted checkout"]]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("trusts the allowlisted directory the session is created from", async () => {
+    const work = realpathSync(mkdirWork("trust-repo"));
+    const home = join(tmp, "home-repo");
+    mkdirSync(home);
+    const { client, close } = await connect({
+      HOME: home,
+      CLAUDE_MCP_CWD: work,
+      CLAUDE_MCP_REPOS: `${work},${process.cwd()}`,
+      CLAUDE_MCP_TRUST_CWD: "1",
+      FAKE_CLAUDE_TRUST: "file",
+    });
+    try {
+      const other = realpathSync(process.cwd());
+      const result = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "trust this repo", repo: other },
+      })) as CallToolResult;
+      assert.notEqual(result.isError, true);
+      const saved = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")) as {
+        projects: Record<string, { hasTrustDialogAccepted?: boolean }>;
+      };
+      const trusted = expectedTrustPath(other);
+      assert.equal(saved.projects[trusted]?.hasTrustDialogAccepted, true);
+      if (trusted !== expectedTrustPath(work)) assert.equal(saved.projects[expectedTrustPath(work)], undefined);
     } finally {
       await close();
     }

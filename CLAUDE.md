@@ -11,12 +11,13 @@ MCP server (TypeScript, Node 20+, `@modelcontextprotocol/sdk`, stdio) that wraps
 ## Conventions
 
 - **Cloud sessions only.** Session tools must always invoke the CLI with `--cloud=`. They must never fall back to running a local Claude Code session, even when a cloud call fails. `src/argv.ts` asserts this invariant, so don't remove it.
-- **Determinism first.** The tool surface is exactly `claude_create_cloud_session`, `claude_send_followup` and `claude_auth_status`. Don't add a catch-all, raw-shell or "arbitrary claude args" tool.
+- **Determinism first.** The tool surface is exactly `claude_create_cloud_session`, `claude_send_followup` and `claude_auth_status`. Don't add a catch-all, raw-shell or "arbitrary claude args" tool. There is no session-read tool: the CLI cannot report a cloud session's status or latest message, and `--teleport` starts a local session.
+- **Repositories.** A create call may pass `repo` only when it matches `CLAUDE_MCP_REPOS` (an absolute directory, or a github.com `owner/name`). GitHub entries are cloned into `CLAUDE_MCP_REPO_CACHE` with a fixed `git` argv (`shell: false`). That git fetch is the only network call. Don't accept arbitrary paths, hosts, or refspecs.
 - Input schemas are strict zod objects (`.strict()` gives `additionalProperties: false`). Every field is typed, with patterns or enums wherever the value set is constrained. Validate in the schema, not ad hoc in handlers.
 - Argv is built only in `src/argv.ts`, in a fixed order, and passed as an array to `spawn` with `shell: false`. Attach values as `--flag=value`, or place them after `--`, so they can't be read as flags.
 - Every tool declares an `outputSchema` and returns `structuredContent`. Errors use the `{ error: { code, message, args, cli } }` shape with a code from `ErrorCode` in `src/server.ts`.
 - Output parsing lives in `src/parse.ts` and never throws on unrecognised create/follow-up output. It returns `parsed: false` plus the raw output instead. When you change a regex, add test cases built from real CLI output.
-- Keep dependencies minimal (the SDK and zod at runtime; TypeScript and `@types/node` for dev). No telemetry, and no network calls of the server's own.
+- Keep dependencies minimal (the SDK and zod at runtime; TypeScript and `@types/node` for dev). No telemetry. The server makes no network calls of its own except `git clone` / `git fetch` for an allowlisted github.com repository.
 
 ## Library docs
 

@@ -14,6 +14,7 @@ import {
   parseFollowupOutput,
 } from "./parse.js";
 import { RunError, runCli, type RunResult, type Runner } from "./runner.js";
+import { REPO_ARG_PATTERN, RepoNotAllowedError, RepoPrepareError, resolveCreateDirectory } from "./repos.js";
 import { claudeJsonPath, ensureWorkspaceTrusted, isTrustPrompt, resolveTrustProjectPath } from "./trust.js";
 
 export const SERVER_NAME = "claude-code-mcp-server";
@@ -31,7 +32,9 @@ export type ErrorCode =
   | "CLI_EXIT_NONZERO"
   | "OUTPUT_PARSE_FAILED"
   | "PTY_UNAVAILABLE"
-  | "WORKSPACE_NOT_TRUSTED";
+  | "WORKSPACE_NOT_TRUSTED"
+  | "REPO_NOT_ALLOWED"
+  | "REPO_PREPARE_FAILED";
 
 // ---- schemas -------------------------------------------------------------
 
@@ -52,6 +55,15 @@ const createInput = z
       .optional()
       .describe(
         "Cloud environment id (e.g. ccpool_...). Overrides CLAUDE_CLOUD_ENVIRONMENT_ID; omit to use that default.",
+      ),
+    repo: z
+      .string()
+      .min(1)
+      .max(4_096)
+      .regex(REPO_ARG_PATTERN)
+      .optional()
+      .describe(
+        "Repository this session packages. An allowlisted absolute directory, github.com owner/name, or https://github.com/owner/name URL on CLAUDE_MCP_REPOS. Omit to use CLAUDE_MCP_CWD.",
       ),
   })
   .strict();
@@ -85,6 +97,11 @@ const createOutput = z
     title: z.string().nullable(),
     parsed: z.boolean().describe("True when both session_id and session_url were parsed from CLI output."),
     environment_id: z.string().nullable(),
+    cwd: z.string().describe("Directory the CLI ran in."),
+    repo: z
+      .string()
+      .nullable()
+      .describe("Normalized repository from the call, or null when the default directory was used."),
     args: z.array(z.string()),
     cli: cliOutput,
   })
@@ -143,12 +160,12 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
    * terminal. Run that argv on a pty. A workspace-trust dialog is refused
    * unless CLAUDE_MCP_TRUST_CWD is set, in which case Enter is sent once.
    */
-  async function runCreate(args: string[], projectPath: string): Promise<PtyRunResult | CallToolResult> {
+  async function runCreate(args: string[], projectPath: string, cwd: string): Promise<PtyRunResult | CallToolResult> {
     let result: PtyRunResult;
     try {
       result = await runCliPty(config.claudeBin, args, config.timeoutMs, {
         pythonBin: config.pythonBin,
-        cwd: config.cwd,
+        cwd,
         onOutput: (output) => {
           if (!isTrustPrompt(output)) return "wait";
           return config.trustCwd ? "accept" : "refuse";
@@ -188,16 +205,31 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
         "Create a new Claude Code cloud session via `claude --cloud` on a pseudo-terminal (the CLI rejects " +
         "this form when stdout is a pipe). Returns the parsed session_id and session_url. If parsing fails, " +
         "`parsed` is false and the CLI output, with terminal controls removed, is in `cli`. The CLI runs in " +
-        "CLAUDE_MCP_CWD, or in the server process's working directory when that is unset. When Claude Code asks " +
-        "to trust that folder, the call fails with WORKSPACE_NOT_TRUSTED unless CLAUDE_MCP_TRUST_CWD=1.",
+        "the directory from `repo` when that is set, otherwise CLAUDE_MCP_CWD (or the server process's working " +
+        "directory when that is unset). `repo` must be on CLAUDE_MCP_REPOS. When Claude Code asks to trust that " +
+        "folder, the call fails with WORKSPACE_NOT_TRUSTED unless CLAUDE_MCP_TRUST_CWD=1.",
       inputSchema: createInput,
       outputSchema: createOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ description, environment_id }) => {
+    async ({ description, environment_id, repo }) => {
       const environmentId = environment_id ?? config.defaultEnvironmentId;
+      let directory;
+      try {
+        directory = await resolveCreateDirectory({
+          requested: repo,
+          defaultCwd: config.cwd,
+          allowlist: config.repos,
+          cacheRoot: config.repoCache,
+          timeoutMs: config.timeoutMs,
+        });
+      } catch (err) {
+        if (err instanceof RepoNotAllowedError) return toolError("REPO_NOT_ALLOWED", err.message, []);
+        if (err instanceof RepoPrepareError) return toolError("REPO_PREPARE_FAILED", err.message, []);
+        throw err;
+      }
       const args = createSessionArgv(description, environmentId);
-      const projectPath = await resolveTrustProjectPath(config.cwd);
+      const projectPath = await resolveTrustProjectPath(directory.cwd);
       if (config.trustCwd) {
         try {
           // Pre-accept trust for this one directory so the dialog usually never
@@ -208,10 +240,17 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
           // Keystroke fallback below covers a dialog the file edit did not prevent.
         }
       }
-      const result = await runCreate(args, projectPath);
+      const result = await runCreate(args, projectPath, directory.cwd);
       if (!isRunResult(result)) return result;
       const parsed = parseCreateOutput(result.stdout);
-      return ok({ ...parsed, environment_id: environmentId, args, cli: cli(result) });
+      return ok({
+        ...parsed,
+        environment_id: environmentId,
+        cwd: directory.cwd,
+        repo: directory.repo,
+        args,
+        cli: cli(result),
+      });
     },
   );
 
@@ -266,8 +305,8 @@ function trustMessage(projectPath: string): string {
   const shown = JSON.stringify(projectPath);
   return (
     `Claude Code asked to trust ${projectPath} before creating a cloud session. ` +
-    `Set CLAUDE_MCP_TRUST_CWD=1 to let this server accept that dialog for CLAUDE_MCP_CWD ` +
-    `(the server process working directory when CLAUDE_MCP_CWD is unset; the main git checkout when that directory is a repository or worktree). ` +
+    `Set CLAUDE_MCP_TRUST_CWD=1 to let this server accept that dialog for the directory this session is created from ` +
+    `(the allowlisted repo when the call sets one, otherwise CLAUDE_MCP_CWD or the server process working directory; the main git checkout when that directory is a repository or worktree). ` +
     `Accepting trust lets that folder's project hooks and allow rules run. ` +
     `To trust it yourself, accept the dialog in an interactive claude session, or set ` +
     `projects[${shown}].hasTrustDialogAccepted to true in ~/.claude.json.`
