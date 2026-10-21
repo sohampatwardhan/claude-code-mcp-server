@@ -1,0 +1,38 @@
+{
+  "name": "claude-code-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server that lets AI agents (Muse, Grok, and other MCP clients) orchestrate Claude Code cloud sessions natively via the Claude Code CLI.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "claude-code-mcp-server": "dist/src/index.js"
+  },
+  "main": "dist/src/server.js",
+  "files": [
+    "dist/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/index.js",
+    "test": "npm run build && node --test dist/test/parse.test.js dist/test/argv-config.test.js dist/test/smoke.test.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "cloud-sessions"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3"
+  }
+}
