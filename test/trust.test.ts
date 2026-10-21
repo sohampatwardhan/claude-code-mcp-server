@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -40,14 +40,14 @@ describe("isTrustPrompt", () => {
 });
 
 describe("ensureWorkspaceTrusted", () => {
-  it("creates ~/.claude.json and preserves other projects", () => {
+  it("creates ~/.claude.json and preserves other projects", async () => {
     const file = join(tmp, "fresh.json");
     writeFileSync(
       file,
       JSON.stringify({ numStartups: 3, projects: { "/elsewhere": { hasTrustDialogAccepted: false, lastCost: 1 } } }) +
         "\n",
     );
-    assert.deepEqual(ensureWorkspaceTrusted(file, "/repo"), { wrote: true });
+    assert.deepEqual(await ensureWorkspaceTrusted(file, "/repo"), { wrote: true });
     const parsed = JSON.parse(readFileSync(file, "utf8")) as {
       numStartups: number;
       projects: Record<string, { hasTrustDialogAccepted?: boolean; lastCost?: number }>;
@@ -56,27 +56,59 @@ describe("ensureWorkspaceTrusted", () => {
     assert.equal(parsed.projects["/elsewhere"]?.hasTrustDialogAccepted, false);
     assert.equal(parsed.projects["/elsewhere"]?.lastCost, 1);
     assert.equal(parsed.projects["/repo"]?.hasTrustDialogAccepted, true);
+    assert.equal(existsSync(`${file}.lock`), false);
   });
 
-  it("does not rewrite a file that is already trusted", () => {
+  it("does not rewrite a file that is already trusted", async () => {
     const file = join(tmp, "already.json");
     const body = '{"projects":{"/repo":{"hasTrustDialogAccepted":true}}}\n';
     writeFileSync(file, body);
-    assert.deepEqual(ensureWorkspaceTrusted(file, "/repo"), { wrote: false });
+    assert.deepEqual(await ensureWorkspaceTrusted(file, "/repo"), { wrote: false });
     assert.equal(readFileSync(file, "utf8"), body);
   });
 
-  it("refuses to clobber a non-object file", () => {
+  it("keeps a field written between two trust updates", async () => {
+    const file = join(tmp, "reread.json");
+    assert.deepEqual(await ensureWorkspaceTrusted(file, "/first"), { wrote: true });
+    const mid = JSON.parse(readFileSync(file, "utf8")) as { projects: Record<string, unknown>; extra?: number };
+    mid.extra = 9;
+    writeFileSync(file, JSON.stringify(mid));
+    assert.deepEqual(await ensureWorkspaceTrusted(file, "/second"), { wrote: true });
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as {
+      extra: number;
+      projects: Record<string, { hasTrustDialogAccepted?: boolean }>;
+    };
+    assert.equal(parsed.extra, 9);
+    assert.equal(parsed.projects["/first"]?.hasTrustDialogAccepted, true);
+    assert.equal(parsed.projects["/second"]?.hasTrustDialogAccepted, true);
+  });
+
+  it("serializes concurrent updates so neither project is dropped", async () => {
+    const file = join(tmp, "concurrent.json");
+    const results = await Promise.all([
+      ensureWorkspaceTrusted(file, "/a"),
+      ensureWorkspaceTrusted(file, "/b"),
+    ]);
+    assert.ok(results.some((result) => result.wrote));
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as {
+      projects: Record<string, { hasTrustDialogAccepted?: boolean }>;
+    };
+    assert.equal(parsed.projects["/a"]?.hasTrustDialogAccepted, true);
+    assert.equal(parsed.projects["/b"]?.hasTrustDialogAccepted, true);
+    assert.equal(existsSync(`${file}.lock`), false);
+  });
+
+  it("refuses to clobber a non-object file", async () => {
     const file = join(tmp, "bad.json");
     writeFileSync(file, "[1, 2]\n");
-    assert.throws(() => ensureWorkspaceTrusted(file, "/repo"), TrustFileError);
+    await assert.rejects(() => ensureWorkspaceTrusted(file, "/repo"), TrustFileError);
     assert.equal(readFileSync(file, "utf8"), "[1, 2]\n");
   });
 
-  it("refuses to clobber a non-object project entry", () => {
+  it("refuses to clobber a non-object project entry", async () => {
     const file = join(tmp, "entry.json");
     writeFileSync(file, '{"projects":{"/repo":"nope"}}\n');
-    assert.throws(() => ensureWorkspaceTrusted(file, "/repo"), TrustFileError);
+    await assert.rejects(() => ensureWorkspaceTrusted(file, "/repo"), TrustFileError);
     assert.equal(readFileSync(file, "utf8"), '{"projects":{"/repo":"nope"}}\n');
   });
 });

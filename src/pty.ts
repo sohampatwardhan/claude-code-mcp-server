@@ -29,6 +29,8 @@ export type PtyTrustDecision = "accept" | "refuse" | "wait";
 export interface PtyRunOptions {
   /** Python interpreter used to allocate the pty. */
   pythonBin: string;
+  /** Directory the CLI runs in. `claude --cloud` packages this tree. */
+  cwd: string;
   /** Called with the raw output so far. Invoked again as more output arrives. */
   onOutput?: (output: string) => PtyTrustDecision;
 }
@@ -212,6 +214,7 @@ export function runCliPty(bin: string, args: string[], timeoutMs: number, option
     const started = Date.now();
     const child = spawn(options.pythonBin, ["-I", helperPath, specPath], {
       shell: false,
+      cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env,
       windowsHide: true,

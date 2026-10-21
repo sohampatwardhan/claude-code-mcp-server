@@ -52,13 +52,13 @@ async function connect(extraEnv: Record<string, string> = {}) {
       return [];
     }
   };
-  const metaCalls = (): { stdoutIsTTY: boolean; stdinIsTTY: boolean }[] => {
+  const metaCalls = (): { cwd: string; stdoutIsTTY: boolean; stdinIsTTY: boolean }[] => {
     try {
       return readFileSync(metaLog, "utf8")
         .trim()
         .split("\n")
         .filter(Boolean)
-        .map((l) => JSON.parse(l) as { stdoutIsTTY: boolean; stdinIsTTY: boolean });
+        .map((l) => JSON.parse(l) as { cwd: string; stdoutIsTTY: boolean; stdinIsTTY: boolean });
     } catch {
       return [];
     }
@@ -73,17 +73,24 @@ async function connect(extraEnv: Record<string, string> = {}) {
   return { client, argvCalls, metaCalls, stdinBytes, close: () => client.close() };
 }
 
-/** Directory the server will mark trusted: main checkout of the test process cwd. */
-function expectedTrustPath(): string {
-  const common = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
-    cwd: process.cwd(),
-    encoding: "utf8",
-  }).trim();
-  if (common.endsWith("/.git")) return common.slice(0, -"/.git".length);
-  return execFileSync("git", ["rev-parse", "--path-format=absolute", "--show-toplevel"], {
-    cwd: process.cwd(),
-    encoding: "utf8",
-  }).trim();
+/** Directory the server will mark trusted for `dir`: main checkout, else `dir`. */
+function expectedTrustPath(dir: string = process.cwd()): string {
+  try {
+    const common = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      cwd: dir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (common.endsWith("/.git")) return common.slice(0, -"/.git".length);
+    const toplevel = execFileSync("git", ["rev-parse", "--path-format=absolute", "--show-toplevel"], {
+      cwd: dir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return toplevel || dir;
+  } catch {
+    return dir;
+  }
 }
 
 function errorBody(result: CallToolResult): { error: { code: string; message: string } } {
@@ -131,9 +138,14 @@ describe("stdio smoke test", () => {
       assert.equal(s.title, "Fix the flaky test");
       assert.equal(s.parsed, true);
       assert.equal(s.environment_id, null);
+      const cli = s.cli as { stdout: string; stderr: string };
+      assert.equal(cli.stderr, "");
+      assert.doesNotMatch(cli.stdout, /[\u0000-\u0008\u000e-\u001f]/);
+      assert.match(cli.stdout, /^Created cloud session: Fix the flaky test\n/);
       assert.deepEqual(argvCalls(), [["--cloud=Fix the flaky test"]]);
       assert.equal(metaCalls()[0]?.stdoutIsTTY, true);
       assert.equal(metaCalls()[0]?.stdinIsTTY, true);
+      assert.equal(metaCalls()[0]?.cwd, process.cwd());
     } finally {
       await close();
     }
@@ -186,6 +198,9 @@ describe("stdio smoke test", () => {
       const s = result.structuredContent as Record<string, unknown>;
       assert.equal(s.sent, true);
       assert.equal(s.session_id, "session_01Target00000000");
+      const cli = s.cli as { stdout: string };
+      assert.doesNotMatch(cli.stdout, /\u001b/);
+      assert.match(cli.stdout, /^Sent to cloud session\.\n/);
       assert.deepEqual(argvCalls(), [["--cloud=session_01Target00000000", "-p", "--", "-- also update the docs"]]);
     } finally {
       await close();
@@ -306,6 +321,43 @@ describe("stdio smoke test", () => {
       assert.equal(errorBody(created).error.code, "PTY_UNAVAILABLE");
       const auth = (await client.callTool({ name: "claude_auth_status", arguments: {} })) as CallToolResult;
       assert.notEqual(auth.isError, true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("runs auth and create in CLAUDE_MCP_CWD and trusts that directory", async () => {
+    const work = join(tmp, "work");
+    const home = join(tmp, "home-cwd");
+    mkdirSync(work);
+    mkdirSync(home);
+    const { client, metaCalls, close } = await connect({
+      HOME: home,
+      CLAUDE_MCP_CWD: work,
+      CLAUDE_MCP_TRUST_CWD: "1",
+      FAKE_CLAUDE_TRUST: "file",
+    });
+    try {
+      const auth = (await client.callTool({ name: "claude_auth_status", arguments: {} })) as CallToolResult;
+      assert.notEqual(auth.isError, true);
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "from cwd env" },
+      })) as CallToolResult;
+      assert.notEqual(created.isError, true);
+      const s = created.structuredContent as { title: string; parsed: boolean; cli: { stdout: string } };
+      assert.equal(s.parsed, true);
+      assert.equal(s.title, "from cwd env");
+      assert.doesNotMatch(s.cli.stdout, /[\u0000-\u0008\u000e-\u001f]/);
+      const meta = metaCalls();
+      assert.equal(meta[0]?.cwd, work);
+      assert.equal(meta[1]?.cwd, work);
+      const saved = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")) as {
+        projects: Record<string, { hasTrustDialogAccepted?: boolean }>;
+      };
+      const trusted = expectedTrustPath(work);
+      assert.equal(saved.projects[trusted]?.hasTrustDialogAccepted, true);
+      if (trusted !== expectedTrustPath()) assert.equal(saved.projects[expectedTrustPath()], undefined);
     } finally {
       await close();
     }

@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { after, describe, it } from "node:test";
 
 import { authStatusArgv, createSessionArgv, sendFollowupArgv } from "../src/argv.js";
 import { ConfigError, DEFAULT_TIMEOUT_MS, loadConfig } from "../src/config.js";
+
+const tmp = mkdtempSync(join(tmpdir(), "claude-mcp-config-"));
+after(() => rmSync(tmp, { recursive: true, force: true }));
 
 describe("argv construction", () => {
   it("builds create argv with a fixed flag order", () => {
@@ -38,6 +44,7 @@ describe("loadConfig", () => {
       timeoutMs: DEFAULT_TIMEOUT_MS,
       trustCwd: false,
       pythonBin: "python3",
+      cwd: process.cwd(),
     });
   });
 
@@ -49,6 +56,7 @@ describe("loadConfig", () => {
         CLAUDE_MCP_TIMEOUT_MS: "1500",
         CLAUDE_MCP_TRUST_CWD: "yes",
         CLAUDE_MCP_PYTHON: "/usr/bin/python3",
+        CLAUDE_MCP_CWD: tmp,
       }),
       {
         claudeBin: "/opt/claude",
@@ -56,8 +64,26 @@ describe("loadConfig", () => {
         timeoutMs: 1500,
         trustCwd: true,
         pythonBin: "/usr/bin/python3",
+        cwd: resolve(tmp),
       },
     );
+  });
+
+  it("resolves a relative CLAUDE_MCP_CWD and rejects a missing path or a file", () => {
+    const dir = join(tmp, "rel");
+    mkdirSync(dir);
+    const saved = process.cwd();
+    try {
+      process.chdir(tmp);
+      assert.equal(loadConfig({ CLAUDE_MCP_CWD: "rel" }).cwd, resolve(tmp, "rel"));
+    } finally {
+      process.chdir(saved);
+    }
+    assert.equal(loadConfig({ CLAUDE_MCP_CWD: "   " }).cwd, process.cwd());
+    assert.throws(() => loadConfig({ CLAUDE_MCP_CWD: join(tmp, "missing") }), ConfigError);
+    const file = join(tmp, "not-a-dir");
+    writeFileSync(file, "x");
+    assert.throws(() => loadConfig({ CLAUDE_MCP_CWD: file }), ConfigError);
   });
 
   it("rejects invalid timeout, environment, and trust-flag values", () => {

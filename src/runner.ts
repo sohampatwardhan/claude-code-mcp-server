@@ -26,18 +26,20 @@ export class RunError extends Error {
   }
 }
 
-export type Runner = (bin: string, args: string[], timeoutMs: number) => Promise<RunResult>;
+export type Runner = (bin: string, args: string[], timeoutMs: number, cwd: string) => Promise<RunResult>;
 
 /**
  * Spawns `bin` with an argv array (never a shell), stdin closed, and a hard
- * timeout. Resolves with the outcome for any process that started; rejects
- * with RunError only when the process could not be started.
+ * timeout. `cwd` is the directory the CLI runs in. Resolves with the outcome
+ * for any process that started; rejects with RunError only when the process
+ * could not be started.
  */
-export const runCli: Runner = (bin, args, timeoutMs) =>
+export const runCli: Runner = (bin, args, timeoutMs, cwd) =>
   new Promise((resolve, reject) => {
     const started = Date.now();
     const child = spawn(bin, args, {
       shell: false,
+      cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, NO_COLOR: "1" },
       windowsHide: true,

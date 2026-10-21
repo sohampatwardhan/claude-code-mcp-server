@@ -8,6 +8,7 @@ import { runCliPty, type PtyRunResult } from "./pty.js";
 import {
   AuthParseError,
   SESSION_REF_PATTERN,
+  cleanTerminalText,
   parseAuthStatus,
   parseCreateOutput,
   parseFollowupOutput,
@@ -75,7 +76,7 @@ const cliOutput = z
     stderr: z.string(),
   })
   .strict()
-  .describe("Raw CLI output, for diagnostics only.");
+    .describe("CLI output with terminal control sequences removed.");
 
 const createOutput = z
   .object({
@@ -121,7 +122,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
   async function run(args: string[]): Promise<RunResult | CallToolResult> {
     let result: RunResult;
     try {
-      result = await runner(config.claudeBin, args, config.timeoutMs);
+      result = await runner(config.claudeBin, args, config.timeoutMs, config.cwd);
     } catch (err) {
       if (err instanceof RunError) return toolError(err.code, err.message, args);
       throw err;
@@ -131,7 +132,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     }
     if (result.exitCode !== 0) {
       const how = result.exitCode === null ? `was killed by ${result.signal}` : `exited with code ${result.exitCode}`;
-      const detail = result.stderr.trim() || result.stdout.trim();
+      const detail = outputDetail(result);
       return toolError("CLI_EXIT_NONZERO", `claude ${how}${detail ? `: ${detail}` : ""}`, args, result);
     }
     return result;
@@ -147,6 +148,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     try {
       result = await runCliPty(config.claudeBin, args, config.timeoutMs, {
         pythonBin: config.pythonBin,
+        cwd: config.cwd,
         onOutput: (output) => {
           if (!isTrustPrompt(output)) return "wait";
           return config.trustCwd ? "accept" : "refuse";
@@ -162,7 +164,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     if (result.timedOut) {
       return toolError("CLI_TIMEOUT", `claude timed out after ${config.timeoutMs} ms`, args, result);
     }
-    if (result.exitCode === 127 && result.stdout.includes("claude binary not found:")) {
+    if (result.exitCode === 127 && cleanTerminalText(result.stdout).includes("claude binary not found:")) {
       return toolError(
         "CLI_NOT_FOUND",
         `claude binary not found: ${config.claudeBin} (set CLAUDE_BIN)`,
@@ -172,7 +174,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     }
     if (result.exitCode !== 0) {
       const how = result.exitCode === null ? `was killed by ${result.signal}` : `exited with code ${result.exitCode}`;
-      const detail = result.stderr.trim() || result.stdout.trim();
+      const detail = outputDetail(result);
       return toolError("CLI_EXIT_NONZERO", `claude ${how}${detail ? `: ${detail}` : ""}`, args, result);
     }
     return result;
@@ -185,9 +187,9 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       description:
         "Create a new Claude Code cloud session via `claude --cloud` on a pseudo-terminal (the CLI rejects " +
         "this form when stdout is a pipe). Returns the parsed session_id and session_url. If parsing fails, " +
-        "`parsed` is false and the raw CLI output is in `cli`. When Claude Code asks to trust the working " +
-        "folder, the call fails with WORKSPACE_NOT_TRUSTED unless CLAUDE_MCP_TRUST_CWD=1, which accepts that " +
-        "dialog for the server's working directory only.",
+        "`parsed` is false and the CLI output, with terminal controls removed, is in `cli`. The CLI runs in " +
+        "CLAUDE_MCP_CWD, or in the server process's working directory when that is unset. When Claude Code asks " +
+        "to trust that folder, the call fails with WORKSPACE_NOT_TRUSTED unless CLAUDE_MCP_TRUST_CWD=1.",
       inputSchema: createInput,
       outputSchema: createOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -195,13 +197,13 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     async ({ description, environment_id }) => {
       const environmentId = environment_id ?? config.defaultEnvironmentId;
       const args = createSessionArgv(description, environmentId);
-      const projectPath = await resolveTrustProjectPath(process.cwd());
+      const projectPath = await resolveTrustProjectPath(config.cwd);
       if (config.trustCwd) {
         try {
           // Pre-accept trust for this one directory so the dialog usually never
           // appears. A corrupt ~/.claude.json is left alone; the pty path can
           // still answer the dialog because the opt-in is set.
-          ensureWorkspaceTrusted(claudeJsonPath(), projectPath);
+          await ensureWorkspaceTrusted(claudeJsonPath(), projectPath);
         } catch {
           // Keystroke fallback below covers a dialog the file edit did not prevent.
         }
@@ -264,8 +266,8 @@ function trustMessage(projectPath: string): string {
   const shown = JSON.stringify(projectPath);
   return (
     `Claude Code asked to trust ${projectPath} before creating a cloud session. ` +
-    `Set CLAUDE_MCP_TRUST_CWD=1 to let this server accept that dialog for the process working directory only ` +
-    `(the main git checkout when the directory is a repository or worktree). ` +
+    `Set CLAUDE_MCP_TRUST_CWD=1 to let this server accept that dialog for CLAUDE_MCP_CWD ` +
+    `(the server process working directory when CLAUDE_MCP_CWD is unset; the main git checkout when that directory is a repository or worktree). ` +
     `Accepting trust lets that folder's project hooks and allow rules run. ` +
     `To trust it yourself, accept the dialog in an interactive claude session, or set ` +
     `projects[${shown}].hasTrustDialogAccepted to true in ~/.claude.json.`
@@ -276,8 +278,16 @@ function isRunResult(value: RunResult | PtyRunResult | CallToolResult): value is
   return "timedOut" in value;
 }
 
+function outputDetail(result: RunResult): string {
+  return cleanTerminalText(result.stderr).trim() || cleanTerminalText(result.stdout).trim();
+}
+
 function cli(result: RunResult) {
-  return { exit_code: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+  return {
+    exit_code: result.exitCode,
+    stdout: cleanTerminalText(result.stdout),
+    stderr: cleanTerminalText(result.stderr),
+  };
 }
 
 function ok(structured: Record<string, unknown>): CallToolResult {

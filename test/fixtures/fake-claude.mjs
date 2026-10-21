@@ -3,7 +3,7 @@
 // CLI's cloud output and never touches the network.
 //
 //   FAKE_CLAUDE_ARGV_LOG   if set, the received argv is appended here as a JSON line
-//   FAKE_CLAUDE_META_LOG   if set, { args, stdoutIsTTY, stdinIsTTY } is appended
+//   FAKE_CLAUDE_META_LOG   if set, { args, cwd, stdoutIsTTY, stdinIsTTY } is appended
 //   FAKE_CLAUDE_STDIN_LOG  if set, bytes read while the trust dialog is up are appended
 //   FAKE_CLAUDE_MODE       "fail" -> exit 1 with stderr; "hang" -> never exit;
 //                          "garbled" -> exit 0 with unparseable output
@@ -29,6 +29,7 @@ if (process.env.FAKE_CLAUDE_META_LOG) {
     process.env.FAKE_CLAUDE_META_LOG,
     JSON.stringify({
       args,
+      cwd: process.cwd(),
       stdoutIsTTY: process.stdout.isTTY === true,
       stdinIsTTY: process.stdin.isTTY === true,
     }) + "\n",
@@ -65,7 +66,9 @@ if (mode === "hang") {
 } else if (args[0]?.startsWith("--cloud=") && args.includes("-p")) {
   const session = args[0].slice("--cloud=".length);
   const id = session.startsWith("http") ? ID : session;
-  process.stdout.write(`Sent to cloud session.\nSession ID: ${id}\nView: https://claude.ai/code/${id}?from=cli&m=0\n`);
+  process.stdout.write(
+    `\u001b7Sent to cloud session.\nSession ID: ${id}\nView: https://claude.ai/code/${id}?from=cli&m=0\n`,
+  );
 } else if (isCreate()) {
   if (process.stdout.isTTY !== true) {
     process.stderr.write(
@@ -94,9 +97,13 @@ if (mode === "hang") {
 
 function writeCreated() {
   const title = args[0].slice("--cloud=".length).split("\n")[0];
+  // Same controls as a real Claude Code pty transcript: ESC 7 / ESC 8 (save
+  // and restore cursor), SI, and CSI with private parameter bytes (`>`, `<`).
   process.stdout.write(
-    `Created cloud session: ${title}\nSession ID: ${ID}\nView: https://claude.ai/code/${ID}?from=cli&m=0\n` +
-      `Resume with: claude --teleport ${ID}\n`,
+    "\u001b7\u001b8" +
+      `Created cloud session: ${title}\nSession ID: ${ID}\nView: https://claude.ai/code/${ID}?from=cli&m=0\n` +
+      `Resume with: claude --teleport ${ID}\n` +
+      "\u000f\u001b[>4m\u001b[<u\u001b7\u001b8",
   );
 }
 

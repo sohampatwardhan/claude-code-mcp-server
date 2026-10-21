@@ -61,6 +61,21 @@ describe("parseCreateOutput", () => {
     assert.equal(parsed.title, "Demo");
   });
 
+  it("parses the real pty create transcript, including cursor-save escapes", () => {
+    const stdout =
+      "\u001b7\u001b8Created cloud session: Single-word ok reply\nView: https://claude.ai/code/session_011fxu2EYatr2hHg3jAszFts?from=cli&m=0\nResume with: claude --teleport session_011fxu2EYatr2hHg3jAszFts\n\u000f\u001b[>4m\u001b[<u\u001b7\u001b8";
+    assert.deepEqual(parseCreateOutput(stdout), {
+      session_id: "session_011fxu2EYatr2hHg3jAszFts",
+      session_url: "https://claude.ai/code/session_011fxu2EYatr2hHg3jAszFts?from=cli&m=0",
+      title: "Single-word ok reply",
+      parsed: true,
+    });
+    assert.equal(
+      stripAnsi(stdout),
+      "Created cloud session: Single-word ok reply\nView: https://claude.ai/code/session_011fxu2EYatr2hHg3jAszFts?from=cli&m=0\nResume with: claude --teleport session_011fxu2EYatr2hHg3jAszFts\n",
+    );
+  });
+
   it("accepts cse_ ids", () => {
     const parsed = parseCreateOutput("Session ID: cse_01ABCdefGHIjklMNOpqr\nView: https://claude.ai/code/cse_01ABCdefGHIjklMNOpqr\n");
     assert.equal(parsed.session_id, "cse_01ABCdefGHIjklMNOpqr");
