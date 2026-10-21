@@ -19,7 +19,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/index.js",
-    "test": "npm run build && node --test dist/test/parse.test.js dist/test/argv-config.test.js dist/test/trust.test.js dist/test/smoke.test.js"
+    "test": "npm run build && node --test dist/test/parse.test.js dist/test/argv-config.test.js dist/test/trust.test.js dist/test/repos.test.js dist/test/smoke.test.js"
   },
   "keywords": [
     "mcp",
