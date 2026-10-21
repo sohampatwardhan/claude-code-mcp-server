@@ -1,6 +1,6 @@
-# claude-code-mcp-server
+# Claude Code MCP Server
 
-MCP server that lets AI agents (Muse, Grok, and other MCP clients) orchestrate Claude Code cloud sessions natively via the Claude Code CLI.
+MCP server that lets AI agents with an always-on cloud computer (e.g. Muse by Meta, Grok Bot by SpaceXSI, ChatGPT Dots by OpenAI, etc) orchestrate Claude Code cloud sessions natively via the Claude Code CLI.
 
 It exposes three tools over stdio: create a cloud session, queue a follow-up message into one, and check the CLI's sign-in state. Each tool maps to one fixed `claude` invocation, and each returns structured JSON. Agents call typed tools and get typed results back, so they never need to write shell commands.
 
