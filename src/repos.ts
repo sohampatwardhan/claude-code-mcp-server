@@ -106,6 +106,25 @@ export interface PullRequest {
   url: string;
 }
 
+/**
+ * First clones are partial: commits and trees come down, file contents only
+ * as git needs them. The checkout still holds every tracked file at HEAD.
+ */
+export const CLONE_FILTER = "blob:none";
+
+/** How `syncCachedCheckout` left the cache. */
+export interface CacheSync {
+  /** Branch checked out. */
+  branch: string;
+  /** True when this call cloned the repository; false when it reused the cache with `git fetch`. */
+  cloned: boolean;
+}
+
+/** A prepared cache checkout, plus how long preparing it took (not counting the lock wait). */
+export interface CacheCheckout extends CacheSync {
+  durationMs: number;
+}
+
 export function isSafeBranchName(branch: string): boolean {
   return BASE_BRANCH_PATTERN.test(branch);
 }
@@ -245,9 +264,9 @@ export async function prepareGithubRepo(
   timeoutMs: number,
   baseBranch: string | null,
 ): Promise<{ cwd: string; branch: string }> {
-  return withPreparedGithubRepo(cacheRoot, owner, name, timeoutMs, baseBranch, async (cwd, branch) => ({
+  return withPreparedGithubRepo(cacheRoot, owner, name, timeoutMs, baseBranch, async (cwd, checkout) => ({
     cwd,
-    branch,
+    branch: checkout.branch,
   }));
 }
 
@@ -262,34 +281,39 @@ export async function withPreparedGithubRepo<T>(
   name: string,
   timeoutMs: number,
   baseBranch: string | null,
-  fn: (cwd: string, branch: string) => Promise<T>,
+  fn: (cwd: string, checkout: CacheCheckout) => Promise<T>,
 ): Promise<T> {
   const dest = githubCacheDir(cacheRoot, owner, name);
   await mkdir(dirname(dest), { recursive: true });
   const staleMs = timeoutMs * 8 + 60_000;
   return withLock(`${dest}.lock`, staleMs, async () => {
-    const branch = await syncCachedCheckout(dest, githubCloneUrl(owner, name), timeoutMs, baseBranch);
-    return fn(dest, branch);
+    const started = Date.now();
+    const synced = await syncCachedCheckout(dest, githubCloneUrl(owner, name), timeoutMs, baseBranch);
+    return fn(dest, { ...synced, durationMs: Date.now() - started });
   });
 }
 
 /**
  * Make `dest` a clean checkout of `originUrl` at `baseBranch`, or at the
- * remote's default branch when `baseBranch` is null. Returns the branch
- * checked out. An existing checkout with a different origin is left untouched.
+ * remote's default branch when `baseBranch` is null. A missing or broken
+ * cache is cloned (partially, see `CLONE_FILTER`); a healthy one is reused
+ * with `git fetch` and never recloned. An existing checkout with a different
+ * origin is left untouched.
  */
 export async function syncCachedCheckout(
   dest: string,
   originUrl: string,
   timeoutMs: number,
   baseBranch: string | null = null,
-): Promise<string> {
+): Promise<CacheSync> {
   if (baseBranch !== null && !isSafeBranchName(baseBranch)) {
     throw new RepoPrepareError(`invalid base branch ${JSON.stringify(baseBranch)}`);
   }
   await mkdir(dirname(dest), { recursive: true });
+  let cloned = false;
   if (!existsSync(dest)) {
     await cloneInto(dest, originUrl, timeoutMs);
+    cloned = true;
   } else {
     const info = statSync(dest);
     if (!info.isDirectory()) throw new RepoPrepareError(`${JSON.stringify(dest)} exists and is not a directory`);
@@ -297,6 +321,7 @@ export async function syncCachedCheckout(
     if (worktree.code !== 0) {
       await rm(dest, { recursive: true, force: true });
       await cloneInto(dest, originUrl, timeoutMs);
+      cloned = true;
     } else {
       await assertOrigin(dest, originUrl, timeoutMs);
     }
@@ -328,7 +353,7 @@ export async function syncCachedCheckout(
   if (checkout.code !== 0) throw new RepoPrepareError(gitDetail("git checkout", checkout));
   const cleaned = await runGit(["clean", "-fd"], dest, timeoutMs);
   if (cleaned.code !== 0) throw new RepoPrepareError(gitDetail("git clean", cleaned));
-  return branch;
+  return { branch, cloned };
 }
 
 /** Branch currently checked out, or null when HEAD is detached or unreadable. */
@@ -553,7 +578,11 @@ function samePullRequest(url: string, owner: string, name: string, number: numbe
 }
 
 async function cloneInto(dest: string, originUrl: string, timeoutMs: number): Promise<void> {
-  const result = await runGit(["clone", "--no-recurse-submodules", "--", originUrl, dest], dirname(dest), timeoutMs);
+  const result = await runGit(
+    ["clone", `--filter=${CLONE_FILTER}`, "--no-recurse-submodules", "--", originUrl, dest],
+    dirname(dest),
+    timeoutMs,
+  );
   if (result.code !== 0) {
     await rm(dest, { recursive: true, force: true });
     throw new RepoPrepareError(gitDetail("git clone", result));

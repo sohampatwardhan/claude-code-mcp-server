@@ -8,6 +8,7 @@
 - New `claude_cancel_session` tool stops a create job that is still running: SIGTERM to every process it started, then SIGKILL 5 s later. It reports `cancelled` and `stopped`. It doesn't stop a cloud session that was already created. Cancelled jobs report `status: "cancelled"`.
 - Every child process now leads its own process group and is tracked. A follow-up, session-status or auth request that the client cancels (for example on its own request timeout) stops its processes. When stdin closes, or on SIGINT, SIGTERM or SIGHUP, the server stops every child before exiting. The pty helper stops `claude --cloud` if the server is killed outright.
 - `claude_create_cloud_session` accepts `timeout_s` (overrides `CLAUDE_MCP_TIMEOUT_MS` for that create) and `idle_timeout_s` (stops `claude --cloud` after that many seconds with no output). The new `CLAUDE_MCP_IDLE_TIMEOUT_MS` sets the idle default, and is off when unset.
+- First clones into `CLAUDE_MCP_REPO_CACHE` are partial (`git clone --filter=blob:none`), so a large repository downloads its history without every old file version. A healthy cache is still reused with `git fetch` and never recloned. The create output (and `job` in `claude_get_session`) gains `cache: { cloned, duration_ms }`.
 
 ## 0.1.1
 
