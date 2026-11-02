@@ -139,6 +139,28 @@ function expectedTrustPath(dir: string = process.cwd()): string {
   }
 }
 
+const JOB_ID = /^job_[0-9a-f]{24}$/;
+
+type Connected = Awaited<ReturnType<typeof connect>>;
+
+/** Poll claude_get_session with a job id until `done(job)` holds or the call fails. */
+async function pollJob(
+  client: Connected["client"],
+  jobId: string,
+  done: (job: Record<string, unknown>) => boolean,
+  timeoutMs = 15_000,
+): Promise<CallToolResult> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const result = (await client.callTool({ name: "claude_get_session", arguments: { session: jobId } })) as CallToolResult;
+    if (result.isError === true) return result;
+    const job = (result.structuredContent as { job: Record<string, unknown> }).job;
+    if (done(job)) return result;
+    assert.ok(Date.now() < deadline, `job ${jobId} did not reach the expected state; last ${JSON.stringify(job)}`);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+  }
+}
+
 function errorBody(result: CallToolResult): { error: { code: string; message: string } } {
   assert.equal(result.isError, true);
   const first = result.content[0];
@@ -171,6 +193,8 @@ describe("stdio smoke test", () => {
       assert.match(client.getInstructions() ?? "", /git format-patch/);
       assert.match(client.getInstructions() ?? "", /claude_get_session/);
       assert.match(client.getInstructions() ?? "", /npm install -g @anthropic-ai\/claude-code/);
+      assert.match(client.getInstructions() ?? "", /job_id/);
+      assert.match(byName.claude_get_session?.description ?? "", /job id/);
       assert.doesNotMatch(client.getInstructions() ?? "", /no status tool/);
       assert.match(byName.claude_create_cloud_session?.description ?? "", /git format-patch/);
       assert.match(byName.claude_send_followup?.description ?? "", /git format-patch/);
@@ -192,6 +216,9 @@ describe("stdio smoke test", () => {
       assert.equal(s.session_url, "https://claude.ai/code/session_01FakeSessionId0000000000?from=cli&m=0");
       assert.equal(s.title, "Fix the flaky test");
       assert.equal(s.parsed, true);
+      assert.equal(s.status, "done");
+      assert.match(String(s.job_id), JOB_ID);
+      assert.equal(typeof s.elapsed_ms, "number");
       assert.equal(s.environment_id, null);
       assert.equal(s.cwd, process.cwd());
       assert.equal(s.repo, null);
@@ -204,6 +231,17 @@ describe("stdio smoke test", () => {
       assert.equal(metaCalls()[0]?.stdoutIsTTY, true);
       assert.equal(metaCalls()[0]?.stdinIsTTY, true);
       assert.equal(metaCalls()[0]?.cwd, process.cwd());
+
+      const read = (await client.callTool({
+        name: "claude_get_session",
+        arguments: { session: String(s.job_id) },
+      })) as CallToolResult;
+      assert.notEqual(read.isError, true);
+      const body = read.structuredContent as { job: Record<string, unknown>; session_id: string; cli: null };
+      assert.deepEqual(body.job, s);
+      assert.equal(body.session_id, "session_01FakeSessionId0000000000");
+      assert.equal(body.cli, null);
+      assert.equal(argvCalls().length, 1, "reading a job runs nothing");
     } finally {
       await close();
     }
@@ -294,7 +332,10 @@ describe("stdio smoke test", () => {
         { name: "claude_create_cloud_session", arguments: { description: "x", base_branch: "a/../../b" } },
         { name: "claude_get_session", arguments: {} },
         { name: "claude_get_session", arguments: { session: "session_01ABCDEFGH", repo: "/tmp" } },
+        { name: "claude_get_session", arguments: { session: "job_xyz" } },
+        { name: "claude_get_session", arguments: { session: "job_0123456789abcdef01234567 --help" } },
         { name: "claude_send_followup", arguments: { session: "--help", message: "hi" } },
+        { name: "claude_send_followup", arguments: { session: "job_0123456789abcdef01234567", message: "hi" } },
         { name: "claude_send_followup", arguments: { session: "session_01ABCDEFGH" } },
         { name: "claude_auth_status", arguments: { verbose: true } },
       ];
@@ -781,6 +822,80 @@ describe("stdio smoke test", () => {
         arguments: { description: "x" },
       })) as CallToolResult;
       assert.equal(errorBody(result).error.code, "CLI_TIMEOUT");
+    } finally {
+      await close();
+    }
+  });
+
+  it("returns a job id for a slow create and reports progress until the session is done", async () => {
+    const { client, argvCalls, close } = await connect({
+      FAKE_CLAUDE_CREATE_DELAY_MS: "2500",
+      FAKE_CLAUDE_CREATE_LINGER_MS: "1500",
+    });
+    try {
+      const started = Date.now();
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "slow create" },
+      })) as CallToolResult;
+      const waited = Date.now() - started;
+      assert.ok(waited < 4_000, `create returned after ${waited} ms`);
+      assert.notEqual(created.isError, true);
+      const pending = created.structuredContent as Record<string, unknown> & { cli: { exit_code: null } };
+      assert.equal(pending.status, "starting");
+      assert.match(String(pending.job_id), JOB_ID);
+      assert.equal(pending.session_id, null);
+      assert.equal(pending.parsed, false);
+      assert.equal(pending.cli.exit_code, null);
+      assert.deepEqual(pending.args, ["--cloud=slow create"]);
+
+      const running = await pollJob(client, String(pending.job_id), (job) => job.status !== "starting");
+      const runningJob = (running.structuredContent as { job: Record<string, unknown> & { cli: { stdout: string } } }).job;
+      assert.equal(runningJob.status, "running");
+      assert.equal(runningJob.session_id, "session_01FakeSessionId0000000000");
+      assert.match(runningJob.cli.stdout, /Created cloud session: slow create/);
+      assert.equal((running.structuredContent as { session_id: string }).session_id, "session_01FakeSessionId0000000000");
+
+      const done = await pollJob(client, String(pending.job_id), (job) => job.status === "done");
+      const doneJob = (done.structuredContent as { job: Record<string, unknown> & { cli: { exit_code: number } } }).job;
+      assert.equal(doneJob.parsed, true);
+      assert.equal(doneJob.title, "slow create");
+      assert.equal(doneJob.cli.exit_code, 0);
+      assert.ok(Number(doneJob.elapsed_ms) >= 3_500, `elapsed_ms ${String(doneJob.elapsed_ms)}`);
+      assert.deepEqual(argvCalls(), [["--cloud=slow create"]]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("reports a create that fails after returning through the job", async () => {
+    const { client, close } = await connect({ FAKE_CLAUDE_MODE: "hang", CLAUDE_MCP_TIMEOUT_MS: "2600" });
+    try {
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "hangs" },
+      })) as CallToolResult;
+      assert.notEqual(created.isError, true);
+      const pending = created.structuredContent as { job_id: string; status: string };
+      assert.equal(pending.status, "starting");
+      const failed = await pollJob(client, pending.job_id, () => false);
+      assert.equal(errorBody(failed).error.code, "CLI_TIMEOUT");
+    } finally {
+      await close();
+    }
+  });
+
+  it("reports an unknown job id as JOB_NOT_FOUND", async () => {
+    const { client, argvCalls, close } = await connect();
+    try {
+      const result = (await client.callTool({
+        name: "claude_get_session",
+        arguments: { session: "job_0123456789abcdef01234567" },
+      })) as CallToolResult;
+      const body = errorBody(result);
+      assert.equal(body.error.code, "JOB_NOT_FOUND");
+      assert.match(body.error.message, /lost when the server restarts/);
+      assert.deepEqual(argvCalls(), []);
     } finally {
       await close();
     }

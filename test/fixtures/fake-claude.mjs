@@ -14,6 +14,10 @@
 //                          unset    -> create does not ask (folder already trusted)
 //   FAKE_CLAUDE_TRUST_QUESTION
 //                          override the dialog question (default is the long form)
+//   FAKE_CLAUDE_CREATE_DELAY_MS
+//                          create waits this long before printing the session
+//   FAKE_CLAUDE_CREATE_LINGER_MS
+//                          create waits this long after printing the session before exiting
 //   FAKE_TELEPORT_MODE     "fail" exits 1 and writes a teleport error; "silent"
 //                          checks out the branch and writes the debug log with
 //                          no pull-request line; "hang" never exits; unset checks
@@ -104,7 +108,12 @@ if (mode === "hang") {
       }
     });
   } else {
-    writeCreated();
+    const delay = Number(process.env.FAKE_CLAUDE_CREATE_DELAY_MS ?? "0");
+    const linger = Number(process.env.FAKE_CLAUDE_CREATE_LINGER_MS ?? "0");
+    setTimeout(() => {
+      writeCreated();
+      if (linger > 0) setTimeout(() => process.exit(0), linger);
+    }, delay);
   }
 } else if (args[0]?.startsWith("--teleport=")) {
   handleTeleport(args[0].slice("--teleport=".length));

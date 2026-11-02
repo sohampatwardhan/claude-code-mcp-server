@@ -7,8 +7,9 @@ import { z } from "zod";
 
 import { authStatusArgv, createSessionArgv, sendFollowupArgv, teleportArgv } from "./argv.js";
 import { ENVIRONMENT_ID_PATTERN, type Config } from "./config.js";
+import { JOB_ID_PATTERN, JobStore, settleWithin, type Job, type JobStatus } from "./jobs.js";
 import { cliNotFoundMessage, isSignInError, signInMessage } from "./prereq.js";
-import { runCliPty, type PtyRunResult } from "./pty.js";
+import { normalizePtyText, runCliPty, type PtyRunResult } from "./pty.js";
 import {
   AuthParseError,
   SESSION_REF_PATTERN,
@@ -18,6 +19,7 @@ import {
   parseCreateOutput,
   parseFollowupOutput,
   parseTeleportOutput,
+  type ParsedCreate,
 } from "./parse.js";
 import { RunError, runCli, type RunResult, type Runner } from "./runner.js";
 import {
@@ -28,6 +30,7 @@ import {
   RepoNotAllowedError,
   RepoPrepareError,
   classifyCreateRequest,
+  githubCacheDir,
   lookupPullRequest,
   parseGithubRepoArg,
   readCheckedOutBranch,
@@ -35,6 +38,7 @@ import {
   teleportDebugPath,
   withPreparedGithubRepo,
   writeSessionRecord,
+  type CreatePlan,
   type GithubRepo,
 } from "./repos.js";
 import { claudeJsonPath, ensureWorkspaceTrusted, isTrustPrompt, resolveTrustProjectPath } from "./trust.js";
@@ -47,6 +51,10 @@ export const SERVER_INSTRUCTIONS =
   "Starts and drives Claude Code cloud sessions. Requires the Claude Code CLI on this machine, installed with " +
   "`npm install -g @anthropic-ai/claude-code` and signed in by running `claude` once (claude_auth_status checks " +
   "this). CLI_NOT_FOUND and CLI_NOT_SIGNED_IN errors say which step is missing.\n\n" +
+  "claude_create_cloud_session returns within a few seconds. When its status is not `done`, the session is " +
+  "still being prepared in the background: call claude_get_session with the returned job_id every few seconds " +
+  "until job.status is `done` (session_id and session_url are then set) or the call returns an error. Job ids " +
+  "are kept in this server's memory only.\n\n" +
   "Check results with claude_get_session, which reports the " +
   "branch a session pushed and any pull request it opened; the conversation and replies are only visible at " +
   "the session's session_url.\n\n" +
@@ -59,6 +67,18 @@ export const SERVER_INSTRUCTIONS =
 
 /** Below Linux's per-argument limit (MAX_ARG_STRLEN, 128 KiB). */
 const MAX_TEXT_LENGTH = 100_000;
+/**
+ * How long create waits for its job before returning a job id. Well under
+ * the 60 s request timeout MCP clients default to.
+ */
+const CREATE_WAIT_MS = 2_000;
+/** Characters of cleaned CLI output a running job reports. */
+const OUTPUT_TAIL_CHARS = 4_000;
+/** Raw CLI output kept per job, to bound memory. Mirrors the pty cap. */
+const MAX_JOB_OUTPUT_CHARS = 4 * 1024 * 1024;
+
+/** `session` for claude_get_session: a session ref or a create job id. */
+const SESSION_OR_JOB_PATTERN = new RegExp(`(?:${SESSION_REF_PATTERN.source})|(?:${JOB_ID_PATTERN.source})`);
 
 export const TOOL_NAMES = [
   "claude_create_cloud_session",
@@ -78,7 +98,8 @@ export type ErrorCode =
   | "REPO_NOT_ALLOWED"
   | "REPO_PREPARE_FAILED"
   | "SESSION_REPO_UNKNOWN"
-  | "CLI_NOT_SIGNED_IN";
+  | "CLI_NOT_SIGNED_IN"
+  | "JOB_NOT_FOUND";
 
 // ---- schemas -------------------------------------------------------------
 
@@ -137,8 +158,10 @@ const sessionInput = z
     session: z
       .string()
       .max(2_000)
-      .regex(SESSION_REF_PATTERN)
-      .describe("Cloud session to read: a session id (session_... / cse_...) or a https://claude.ai/code/... URL."),
+      .regex(SESSION_OR_JOB_PATTERN)
+      .describe(
+        "What to read: a job id (job_...) returned by claude_create_cloud_session, or a cloud session id (session_... / cse_...) or https://claude.ai/code/... URL.",
+      ),
     repo: z
       .string()
       .min(1)
@@ -146,7 +169,7 @@ const sessionInput = z
       .regex(GITHUB_REPO_ARG_PATTERN)
       .optional()
       .describe(
-        "github.com owner/name the session was started in. Omit when this server created the session with repo set; that repository is recorded in the cache.",
+        "github.com owner/name the session was started in. Omit when this server created the session with repo set; that repository is recorded in the cache. Ignored for a job id.",
       ),
   })
   .strict();
@@ -164,6 +187,13 @@ const cliOutput = z
 
 const createOutput = z
   .object({
+    job_id: z.string().describe("Background job for this create. Pass it to claude_get_session until status is done."),
+    status: z
+      .enum(["cloning", "starting", "running", "done"])
+      .describe(
+        "cloning: preparing the GitHub cache checkout. starting: claude --cloud is running and has not printed a session yet. running: the session id was printed and the CLI has not exited. done: the CLI exited and the result below is final.",
+      ),
+    elapsed_ms: z.number().int().describe("Time since the job started, or its total duration once done."),
     session_id: z.string().nullable(),
     session_url: z.string().nullable(),
     title: z.string().nullable(),
@@ -179,14 +209,19 @@ const createOutput = z
       .nullable()
       .describe("Branch the GitHub cache checkout was on, or null when no GitHub repository was selected."),
     args: z.array(z.string()),
-    cli: cliOutput,
+    cli: cliOutput.describe(
+      "CLI output with terminal control sequences removed. Until status is done, exit_code is null and stdout holds the last 4,000 characters so far.",
+    ),
   })
   .strict();
 
 const sessionOutput = z
   .object({
-    session_id: z.string(),
-    repo: z.string().describe("github.com owner/name the status read used."),
+    job: createOutput
+      .nullable()
+      .describe("Set when `session` was a job id: that create's progress or result. The other fields are then null, false or empty."),
+    session_id: z.string().nullable(),
+    repo: z.string().nullable().describe("github.com owner/name the status read used."),
     branch: z.string().nullable().describe("Branch the cloud session pushed, or null when none is checked out yet."),
     base_branch: z.string().nullable().describe("Branch the cache was reset to before teleport."),
     pr_number: z.number().int().nullable(),
@@ -195,9 +230,20 @@ const sessionOutput = z
     pr_error: z.string().nullable().describe("Set when gh could not look up a pull request. Null when there is no pull request."),
     parsed: z.boolean().describe("True when the pushed branch was identified."),
     args: z.array(z.string()),
-    cli: cliOutput,
+    cli: cliOutput.nullable(),
   })
   .strict();
+
+type CreateBody = z.infer<typeof createOutput>;
+
+/** Fixed fields of one create job. `cwd` and `baseBranch` are updated once the cache checkout is ready. */
+interface CreateJob {
+  args: string[];
+  environmentId: string | null;
+  cwd: string;
+  repo: string | null;
+  baseBranch: string | null;
+}
 
 const followupOutput = z
   .object({
@@ -226,6 +272,7 @@ const authOutput = z
 
 export function createServer(config: Config, runner: Runner = runCli): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: SERVER_INSTRUCTIONS });
+  const jobs = new JobStore<CreateJob>();
 
   /** Runs the CLI; returns the result on exit 0, otherwise a tool error. */
   async function run(args: string[]): Promise<RunResult | CallToolResult> {
@@ -250,12 +297,18 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
    * terminal. Run that argv on a pty. A workspace-trust dialog is refused
    * unless CLAUDE_MCP_TRUST_CWD is set, in which case Enter is sent once.
    */
-  async function runCreate(args: string[], projectPath: string, cwd: string): Promise<PtyRunResult | CallToolResult> {
+  async function runCreate(
+    args: string[],
+    projectPath: string,
+    cwd: string,
+    onProgress: (chunk: string) => void,
+  ): Promise<PtyRunResult | CallToolResult> {
     let result: PtyRunResult;
     try {
       result = await runCliPty(config.claudeBin, args, config.timeoutMs, {
         pythonBin: config.pythonBin,
         cwd,
+        onProgress,
         onOutput: (output) => {
           if (!isTrustPrompt(output)) return "wait";
           return config.trustCwd ? "accept" : "refuse";
@@ -291,8 +344,11 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       title: "Create Claude Code cloud session",
       description:
         "Create a new Claude Code cloud session via `claude --cloud` on a pseudo-terminal (the CLI rejects " +
-        "this form when stdout is a pipe). Returns the parsed session_id and session_url. If parsing fails, " +
-        "`parsed` is false and the CLI output, with terminal controls removed, is in `cli`. A github.com " +
+        "this form when stdout is a pipe). The work runs as a background job and this call returns within a " +
+        "few seconds. If `status` is `done`, the result is final: the parsed session_id and session_url, or, " +
+        "when parsing fails, `parsed` false and the CLI output (terminal controls removed) in `cli`. Otherwise " +
+        "poll claude_get_session with `job_id` until `job.status` is `done` or the call returns an error; " +
+        "failures surface there with the same error codes. A github.com " +
         "`repo` is cloned into CLAUDE_MCP_REPO_CACHE (origin set to that GitHub repository) and, when " +
         "`base_branch` is set, checked out there before the CLI runs. Any other absolute directory must be " +
         "on CLAUDE_MCP_REPOS. Omit `repo` to use CLAUDE_MCP_CWD. When Claude Code asks to trust the chosen " +
@@ -306,7 +362,8 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     },
     async ({ description, environment_id, repo, base_branch }) => {
       const environmentId = environment_id ?? config.defaultEnvironmentId;
-      let plan;
+      let plan: CreatePlan;
+      let cwd: string;
       try {
         plan = classifyCreateRequest({
           requested: repo,
@@ -314,40 +371,57 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
           defaultCwd: config.cwd,
           allowlist: config.repos,
         });
+        cwd = plan.kind === "github" ? githubCacheDir(config.repoCache, plan.github.owner, plan.github.name) : plan.cwd;
       } catch (err) {
         if (err instanceof RepoNotAllowedError) return toolError("REPO_NOT_ALLOWED", err.message, []);
         if (err instanceof RepoPrepareError) return toolError("REPO_PREPARE_FAILED", err.message, []);
         throw err;
       }
-      try {
-        if (plan.kind === "github") {
-          const github = plan.github;
-          return await withPreparedGithubRepo(
-            config.repoCache,
-            github.owner,
-            github.name,
-            config.timeoutMs,
-            plan.baseBranch,
-            (cwd, branch) => finishCreate(description, environmentId, cwd, github.slug, branch, github),
-          );
-        }
-        return await finishCreate(description, environmentId, plan.cwd, plan.kind === "path" ? plan.repo : null, null, null);
-      } catch (err) {
-        if (err instanceof RepoPrepareError) return toolError("REPO_PREPARE_FAILED", err.message, []);
-        throw err;
-      }
+      const details: CreateJob = {
+        args: createSessionArgv(description, environmentId),
+        environmentId,
+        cwd,
+        repo: plan.kind === "github" ? plan.github.slug : plan.kind === "path" ? plan.repo : null,
+        baseBranch: plan.kind === "github" ? plan.baseBranch : null,
+      };
+      const target = plan;
+      const job = jobs.start(details, plan.kind === "github" ? "cloning" : "starting", (started) =>
+        runCreateJob(started, target),
+      );
+      await settleWithin(job, CREATE_WAIT_MS);
+      if (job.failure !== null) throw job.failure.error;
+      return job.result ?? ok(pendingBody(job));
     },
   );
 
-  async function finishCreate(
-    description: string,
-    environmentId: string | null,
-    cwd: string,
-    repo: string | null,
-    baseBranch: string | null,
-    github: GithubRepo | null,
-  ): Promise<CallToolResult> {
-    const args = createSessionArgv(description, environmentId);
+  /** Clone (for GitHub), then run `claude --cloud`. Settles with the final tool result. */
+  async function runCreateJob(job: Job<CreateJob>, plan: CreatePlan): Promise<CallToolResult> {
+    try {
+      if (plan.kind === "github") {
+        const github = plan.github;
+        return await withPreparedGithubRepo(
+          config.repoCache,
+          github.owner,
+          github.name,
+          config.timeoutMs,
+          plan.baseBranch,
+          (cwd, branch) => {
+            job.details.cwd = cwd;
+            job.details.baseBranch = branch;
+            return finishCreate(job, github);
+          },
+        );
+      }
+      return await finishCreate(job, null);
+    } catch (err) {
+      if (err instanceof RepoPrepareError) return toolError("REPO_PREPARE_FAILED", err.message, []);
+      throw err;
+    }
+  }
+
+  async function finishCreate(job: Job<CreateJob>, github: GithubRepo | null): Promise<CallToolResult> {
+    const { args, cwd, baseBranch } = job.details;
+    job.status = "starting";
     const projectPath = await resolveTrustProjectPath(cwd);
     if (config.trustCwd) {
       try {
@@ -359,7 +433,9 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
         // Keystroke fallback below covers a dialog the file edit did not prevent.
       }
     }
-    const result = await runCreate(args, projectPath, cwd);
+    const result = await runCreate(args, projectPath, cwd, (chunk) => {
+      if (job.output.length < MAX_JOB_OUTPUT_CHARS) job.output += chunk;
+    });
     if (!isRunResult(result)) return result;
     const parsed = parseCreateOutput(result.stdout);
     if (github !== null && parsed.parsed && parsed.session_id !== null) {
@@ -375,14 +451,64 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
         // The session exists. Status can still be called with an explicit repo.
       }
     }
-    return ok({
+    return ok(createBody(job, "done", parsed, cli(result)));
+  }
+
+  function createBody(job: Job<CreateJob>, status: JobStatus, parsed: ParsedCreate, output: CreateBody["cli"]): CreateBody {
+    const { args, environmentId, cwd, repo, baseBranch } = job.details;
+    return {
+      job_id: job.id,
+      status,
+      elapsed_ms: jobs.elapsedMs(job),
       ...parsed,
       environment_id: environmentId,
       cwd,
       repo,
       base_branch: baseBranch,
       args,
-      cli: cli(result),
+      cli: output,
+    };
+  }
+
+  /** Progress of a job that has not settled: parsed fields and the tail of the output so far. */
+  function pendingBody(job: Job<CreateJob>): CreateBody {
+    const text = normalizePtyText(job.output);
+    const parsed = parseCreateOutput(text);
+    const status = job.status === "starting" && parsed.session_id !== null ? "running" : job.status;
+    const cleaned = cleanTerminalText(text);
+    return createBody(job, status, parsed, {
+      exit_code: null,
+      stdout: cleaned.length > OUTPUT_TAIL_CHARS ? cleaned.slice(-OUTPUT_TAIL_CHARS) : cleaned,
+      stderr: "",
+    });
+  }
+
+  /** claude_get_session for a job id: progress, the final result, or the job's tool error. */
+  function readJob(id: string): CallToolResult {
+    const job = jobs.get(id);
+    if (job === null) {
+      return toolError(
+        "JOB_NOT_FOUND",
+        `No create job ${id} on this server. Jobs live in memory, are dropped an hour after they finish, and are lost when the server restarts. Use the session_id from a finished job, or create the session again.`,
+        [],
+      );
+    }
+    if (job.failure !== null) throw job.failure.error;
+    if (job.result !== null && job.result.isError === true) return job.result;
+    const body = job.result !== null ? (job.result.structuredContent as CreateBody) : pendingBody(job);
+    return ok({
+      job: body,
+      session_id: body.session_id,
+      repo: null,
+      branch: null,
+      base_branch: null,
+      pr_number: null,
+      pr_url: null,
+      pr_source: null,
+      pr_error: null,
+      parsed: false,
+      args: [],
+      cli: null,
     });
   }
 
@@ -414,7 +540,10 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     {
       title: "Cloud session GitHub status",
       description:
-        "Report the branch a cloud session pushed and any pull request it opened. Prepares the github.com " +
+        "With a job id from claude_create_cloud_session, report that create's progress in `job` (status, " +
+        "elapsed time, the tail of the CLI output, and session_id once the CLI prints it), its final result once " +
+        "`job.status` is `done`, or its error; this reads memory only and runs nothing. " +
+        "With a session id or URL, report the branch a cloud session pushed and any pull request it opened. Prepares the github.com " +
         "checkout in CLAUDE_MCP_REPO_CACHE (origin set to that repository), then runs print-mode " +
         "`claude --teleport=<session> --debug` there and stops when the CLI exits. Print mode checks out " +
         "the session branch and exits; it is not given a prompt and it is not started on a terminal, so it " +
@@ -427,6 +556,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async ({ session, repo }) => {
+      if (JOB_ID_PATTERN.test(session)) return readJob(session);
       const sessionId = sessionIdOf(session);
       if (sessionId === null) {
         return toolError("OUTPUT_PARSE_FAILED", `Could not read a session id from ${JSON.stringify(session)}.`, []);
@@ -527,6 +657,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     }
     const stderr = [cleanTerminalText(result.stderr).trim(), ...parsed.notes].filter((line) => line !== "").join("\n");
     return ok({
+      job: null,
       session_id: sessionId,
       repo: github.slug,
       branch,

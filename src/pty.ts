@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 import { RunError, type RunResult } from "./runner.js";
 
@@ -33,6 +34,8 @@ export interface PtyRunOptions {
   cwd: string;
   /** Called with the raw output so far. Invoked again as more output arrives. */
   onOutput?: (output: string) => PtyTrustDecision;
+  /** Called with each decoded chunk of raw output, including after the trust dialog is answered. */
+  onProgress?: (chunk: string) => void;
 }
 
 /**
@@ -266,8 +269,10 @@ export function runCliPty(bin: string, args: string[], timeoutMs: number, option
       }, TRUST_ACCEPT_DELAY_MS);
     };
 
+    const progress = new StringDecoder("utf8");
     child.stdout.on("data", (chunk: Buffer) => {
       stdout.push(chunk);
+      options.onProgress?.(progress.write(chunk));
       consider();
     });
     child.stderr.on("data", stderr.push);
