@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { open, unlink } from "node:fs/promises";
-import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -35,13 +35,26 @@ export function isTrustPrompt(output: string): boolean {
  */
 export async function resolveTrustProjectPath(cwd: string): Promise<string> {
   const toplevel = await git(cwd, ["rev-parse", "--path-format=absolute", "--show-toplevel"]);
-  if (toplevel === null || !isAbsolute(toplevel)) return resolve(cwd);
+  if (toplevel === null || !isAbsolute(toplevel)) return physicalPath(cwd);
   const common = await git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
   if (common !== null && basename(common) === ".git") {
     const main = dirname(common);
     if (isAbsolute(main)) return main;
   }
   return toplevel;
+}
+
+/**
+ * The CLI runs with `cwd` as its working directory, and process.cwd() there is
+ * the physical path (on macOS /var/... becomes /private/var/...). git already
+ * reports physical paths, so only the non-git fallback needs resolving.
+ */
+function physicalPath(cwd: string): string {
+  try {
+    return realpathSync(cwd);
+  } catch {
+    return resolve(cwd);
+  }
 }
 
 const LOCK_STALE_MS = 5_000;
