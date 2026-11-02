@@ -15,6 +15,27 @@ export const DEFAULT_TIMEOUT_MS = 300_000;
 /** Environment ids are opaque tokens such as `ccpool_...`. */
 export const ENVIRONMENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
+/** Shortest `CLAUDE_MCP_TOKEN` accepted. */
+export const MIN_TOKEN_LENGTH = 32;
+
+/** Hostnames every HTTP server accepts in the Host header: loopback only. */
+export const LOOPBACK_HOSTNAMES = ["localhost", "127.0.0.1", "[::1]"] as const;
+
+/** Streamable HTTP listener settings, present only when `CLAUDE_MCP_HTTP_PORT` is set. */
+export interface HttpConfig {
+  /** Address to bind. `127.0.0.1` unless `CLAUDE_MCP_HTTP_HOST` says otherwise. */
+  host: string;
+  /** Port to bind; 0 lets the OS pick one (used by tests). */
+  port: number;
+  /** Bearer token every request must carry. Never logged or echoed. */
+  token: string;
+  /**
+   * Hostnames (port-agnostic, as the URL API parses the Host header) a request
+   * may name: loopback, the bind host, and `CLAUDE_MCP_HTTP_ALLOWED_HOSTS`.
+   */
+  allowedHosts: string[];
+}
+
 export interface Config {
   /** Path or name of the `claude` binary. */
   claudeBin: string;
@@ -55,6 +76,8 @@ export interface Config {
    * of which runs shell commands without asking. Off by default.
    */
   localAllowShell: boolean;
+  /** Streamable HTTP transport, or null for stdio (the default). */
+  http: HttpConfig | null;
 }
 
 export class ConfigError extends Error {
@@ -105,6 +128,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     repoCache,
     localRoots,
     localAllowShell,
+    http: parseHttp(env),
   };
 }
 
@@ -150,6 +174,49 @@ function parseMilliseconds(name: string, raw: string | undefined): number | null
     throw new ConfigError(`${name} must be a positive integer (milliseconds), got ${JSON.stringify(raw)}`);
   }
   return Number(value);
+}
+
+/**
+ * HTTP is off unless `CLAUDE_MCP_HTTP_PORT` is set. Then `CLAUDE_MCP_TOKEN` is
+ * required, so the listener never starts without authentication. Messages
+ * never include the token.
+ */
+function parseHttp(env: NodeJS.ProcessEnv): HttpConfig | null {
+  const rawPort = (env.CLAUDE_MCP_HTTP_PORT ?? "").trim();
+  if (rawPort === "") return null;
+  if (!/^(?:0|[1-9][0-9]{0,4})$/.test(rawPort) || Number(rawPort) > 65_535) {
+    throw new ConfigError(`CLAUDE_MCP_HTTP_PORT must be a port number from 0 to 65535, got ${JSON.stringify(rawPort)}`);
+  }
+  const token = env.CLAUDE_MCP_TOKEN ?? "";
+  if (token === "") {
+    throw new ConfigError("CLAUDE_MCP_HTTP_PORT is set but CLAUDE_MCP_TOKEN is not; the HTTP transport refuses to start without a token");
+  }
+  if (token.length < MIN_TOKEN_LENGTH || token.length > 1_024 || !/^[\x21-\x7e]+$/.test(token)) {
+    throw new ConfigError(
+      `CLAUDE_MCP_TOKEN must be ${MIN_TOKEN_LENGTH} to 1024 printable characters with no whitespace (for example \`openssl rand -hex 32\`)`,
+    );
+  }
+  const host = (env.CLAUDE_MCP_HTTP_HOST ?? "").trim() || "127.0.0.1";
+  if (!/^[A-Za-z0-9.:-]{1,253}$/.test(host)) {
+    throw new ConfigError(`CLAUDE_MCP_HTTP_HOST must be an IP address or hostname, got ${JSON.stringify(host)}`);
+  }
+  const allowed = new Set<string>(LOOPBACK_HOSTNAMES);
+  const bind = hostnameOf(host);
+  if (bind !== "0.0.0.0" && bind !== "[::]") allowed.add(bind);
+  for (const part of (env.CLAUDE_MCP_HTTP_ALLOWED_HOSTS ?? "").split(",")) {
+    const entry = part.trim().toLowerCase();
+    if (entry === "") continue;
+    if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*|\[[0-9a-f:.]+\])$/.test(entry)) {
+      throw new ConfigError(`CLAUDE_MCP_HTTP_ALLOWED_HOSTS entries must be hostnames without a port or scheme, got ${JSON.stringify(entry)}`);
+    }
+    allowed.add(entry);
+  }
+  return { host, port: Number(rawPort), token, allowedHosts: [...allowed] };
+}
+
+/** The bind address as the URL API reports a Host header's hostname (IPv6 in brackets). */
+function hostnameOf(host: string): string {
+  return host.includes(":") ? `[${host.toLowerCase()}]` : host.toLowerCase();
 }
 
 /** Empty means false. `1` / `true` / `yes` (any case) mean true. */

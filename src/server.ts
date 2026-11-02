@@ -473,10 +473,24 @@ const authOutput = z
 
 // ---- server --------------------------------------------------------------
 
-export function createServer(config: Config, runner: Runner = runCli): McpServer {
+/**
+ * State one server process keeps across MCP connections: the job stores.
+ * Stdio has one connection; the HTTP transport builds a server per request
+ * and passes the same state, so a job started in one request can be polled
+ * or cancelled from another.
+ */
+export interface ServerState {
+  jobs: JobStore<CreateJob>;
+  localJobs: JobStore<LocalJob>;
+}
+
+export function createServerState(): ServerState {
+  return { jobs: new JobStore<CreateJob>(), localJobs: new JobStore<LocalJob>() };
+}
+
+export function createServer(config: Config, runner: Runner = runCli, state: ServerState = createServerState()): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: SERVER_INSTRUCTIONS });
-  const jobs = new JobStore<CreateJob>();
-  const localJobs = new JobStore<LocalJob>();
+  const { jobs, localJobs } = state;
 
   /** Runs the CLI; returns the result on exit 0, otherwise a tool error. */
   async function run(args: string[]): Promise<RunResult | CallToolResult> {

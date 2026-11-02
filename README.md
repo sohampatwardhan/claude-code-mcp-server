@@ -23,6 +23,7 @@ It exposes six tools over stdio: create a cloud session, queue a follow-up messa
 - **Cloud sessions.** Create and follow-up always pass `--cloud=`. Session status runs print-mode `claude --teleport=<session>` inside the server's cache so the CLI can check out the branch the cloud session pushed, then the process exits. That argv carries no prompt and is not attached to a terminal.
 - **Local runs are opt-in.** `claude_run_local` is the only tool that runs Claude Code on this machine (`claude -p`). It refuses every call until `CLAUDE_MCP_LOCAL_ROOTS` lists directories, only runs inside them (after resolving symlinks), always passes an explicit permission mode from a fixed set, and never bypasses permissions. Until a second opt-in, `CLAUDE_MCP_LOCAL_ALLOW_SHELL`, is set, every run uses Claude Code's `--restricted` mode: no shell or code-running tools, and the checkout's settings, hooks and `.mcp.json` aren't loaded.
 - **No orphaned processes.** Every child (git, `gh`, the pty helper, `claude`) leads its own process group and is tracked. A cancelled create, or an MCP request the client cancels (for example on its own timeout), stops its processes with SIGTERM, then SIGKILL 5 s later. When the client closes stdin, or the server gets SIGINT, SIGTERM or SIGHUP, the server stops every child before it exits. If the server is killed outright, the pty helper notices and stops `claude --cloud` the same way. Only `git` and `gh` processes that are already running can outlive a SIGKILL, and each is bound by `CLAUDE_MCP_TIMEOUT_MS`.
+- **Remote access is opt-in and private.** By default the server speaks MCP over stdio and opens no port. Setting `CLAUDE_MCP_HTTP_PORT` adds a Streamable HTTP listener on `127.0.0.1`. It refuses to start without `CLAUDE_MCP_TOKEN`, checks the `Host` and `Origin` headers against an allow list (DNS-rebinding protection), and answers 401 to any request without the right bearer token before MCP sees it. Expose it to other machines with `tailscale serve`, never Funnel or the public internet.
 - **No telemetry.** The server runs the local `claude` binary. Its own network calls are `git clone` / `git fetch` of a validated `https://github.com/owner/name.git` into the cache, and a read-only `gh pr list` when status needs a pull request number.
 
 ## Prerequisites
@@ -108,6 +109,63 @@ The server speaks MCP over stdin/stdout. Normally the MCP client launches it, so
 npm start                       # same as: node dist/src/index.js
 ```
 
+### Remote access over HTTP
+
+To drive Claude Code on one machine (for example a Mac with your checkouts and toolchain) from an orchestrator running somewhere else (Muse, Grok Bot, ChatGPT Dots, Claude Duet), run the server with the Streamable HTTP transport and reach it over your tailnet.
+
+```bash
+export CLAUDE_MCP_TOKEN="$(openssl rand -hex 32)"
+CLAUDE_MCP_HTTP_PORT=8787 npx -y @sohampatwardhan/claude-code-mcp-server@latest
+```
+
+It prints `listening on http://127.0.0.1:8787/mcp` on stderr and serves MCP at that one path:
+
+- **Stateless Streamable HTTP.** Only `POST /mcp` is answered, with JSON responses. `GET` and `DELETE` get 405, and other paths 404. Jobs are shared across requests and connections, so a `job_id` from one request can be polled or cancelled from any later one, as on stdio.
+- **Checks, in order, before any MCP handling:**
+  - The `Host` header (any port) must name an allowed host, else 403. That's loopback, the bind address, or `CLAUDE_MCP_HTTP_ALLOWED_HOSTS`.
+  - An `Origin` header, when present, must too, else 403.
+  - `Authorization: Bearer <CLAUDE_MCP_TOKEN>` must match, compared in constant time, else 401 with `WWW-Authenticate: Bearer`.
+  - Bodies over 1 MiB get 413.
+- **Shutdown.** SIGINT, SIGTERM or SIGHUP closes the listener and stops every child the server started (create jobs, local runs, git), as on stdio. Closing stdin does nothing in HTTP mode, so it runs under `launchd` with stdin on `/dev/null`.
+
+**Expose it privately with `tailscale serve`.** Keep the server on `127.0.0.1` and let Tailscale terminate HTTPS for your tailnet only:
+
+```bash
+tailscale serve --bg --https=443 http://127.0.0.1:8787
+```
+
+Then set `CLAUDE_MCP_HTTP_ALLOWED_HOSTS` to the machine's tailnet name (for example `mymac.tail1234.ts.net`), because Tailscale forwards requests with that name as their `Host` header (a 403 "Host not allowed" means it's missing). Clients on your tailnet connect to `https://mymac.tail1234.ts.net/mcp` with the bearer token. **Never use `tailscale funnel`**, port forwarding, or a public bind address. The token is the only credential on this endpoint, and the tools can start Claude Code sessions on your account.
+
+**Run it under `launchd` on macOS** so it starts at login in your user session. Signed-in Claude Code needs your login keychain, which a launch agent in your session can reach and a bare SSH session often can't. Save as `~/Library/LaunchAgents/com.example.claude-code-mcp.plist`, put the token in it, `chmod 600` it, then `launchctl load` it:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.claude-code-mcp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/npx</string>
+    <string>-y</string>
+    <string>@sohampatwardhan/claude-code-mcp-server@latest</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>CLAUDE_MCP_HTTP_PORT</key><string>8787</string>
+    <key>CLAUDE_MCP_TOKEN</key><string>paste-the-token-here</string>
+    <key>CLAUDE_MCP_HTTP_ALLOWED_HOSTS</key><string>mymac.tail1234.ts.net</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>/tmp/claude-code-mcp.log</string>
+</dict>
+</plist>
+```
+
+Add the other variables you use (`CLAUDE_MCP_REPO_CACHE`, `CLAUDE_MCP_LOCAL_ROOTS`, ...) to the same `EnvironmentVariables` block. The log file gets the listening line and warnings, never the token.
+
 ### Environment variables
 
 | Variable | Default | Meaning |
@@ -123,6 +181,10 @@ npm start                       # same as: node dist/src/index.js
 | `CLAUDE_MCP_REPO_CACHE` | `~/.claude-mcp/repos` | Directory that holds checkouts of GitHub repositories named by a call. Created on first use. An existing path must be a directory. This directory is the allowlist for where clones are written. |
 | `CLAUDE_MCP_LOCAL_ROOTS` | empty (local runs off) | Comma-separated absolute directories `claude_run_local` may run in, together with everything under them. Each must exist at startup and is compared in its real-path form. The filesystem root `/` is refused. Print mode skips Claude Code's workspace-trust dialog; while `CLAUDE_MCP_LOCAL_ALLOW_SHELL` is off, `--restricted` keeps a checkout's settings from loading, but Claude still reads and edits every file under the roots. |
 | `CLAUDE_MCP_LOCAL_ALLOW_SHELL` | off | `1` / `true` / `yes` drops `--restricted` from local runs and lets them pre-approve `Bash` or use `permission_mode: "auto"`, either of which runs shell commands on this machine without asking. **It also trusts every checkout under the roots:** their project settings, hooks, allow rules and `.mcp.json` servers load as in a normal `claude -p`. Off, `Bash` and `auto` fail with `LOCAL_SHELL_DISABLED`. |
+| `CLAUDE_MCP_HTTP_PORT` | unset (stdio) | Port for the [Streamable HTTP transport](#remote-access-over-http). Setting it is what turns HTTP on; stdio stays the default. `0` picks a free port. Requires `CLAUDE_MCP_TOKEN`. |
+| `CLAUDE_MCP_HTTP_HOST` | `127.0.0.1` | Address the HTTP transport binds. Keep it on loopback and put `tailscale serve` in front; the server warns on stderr when it binds anything else. |
+| `CLAUDE_MCP_TOKEN` | unset | Bearer token every HTTP request must send (`Authorization: Bearer <token>`): 32 to 1024 printable characters, no whitespace (`openssl rand -hex 32`). The HTTP transport refuses to start without it (exit 2). Never logged. |
+| `CLAUDE_MCP_HTTP_ALLOWED_HOSTS` | empty | Extra comma-separated hostnames (no port or scheme) the HTTP transport accepts in the `Host` and `Origin` headers, besides `localhost`, `127.0.0.1`, `[::1]` and the bind address. Add your Tailscale name, for example `mymac.tail1234.ts.net`, when using `tailscale serve`. |
 
 If any of these values is invalid, the server exits at startup with code 2 and prints a message on stderr.
 
@@ -549,6 +611,20 @@ Cursor, Claude Desktop, and a generic stdio entry are in [Install](#install). Th
 
 A global install (`npm install -g @sohampatwardhan/claude-code-mcp-server`) exposes the same bin as `"command": "claude-code-mcp-server"` with `"args": []`.
 
+An orchestrator on another machine connects over [HTTP](#remote-access-over-http) instead: a Streamable HTTP server entry with the URL and the bearer token header, in whatever form the client takes it, for example:
+
+```json
+{
+  "mcpServers": {
+    "claude-code": {
+      "type": "http",
+      "url": "https://mymac.tail1234.ts.net/mcp",
+      "headers": { "Authorization": "Bearer <CLAUDE_MCP_TOKEN>" }
+    }
+  }
+}
+```
+
 ## Development
 
 ```sh
@@ -572,6 +648,7 @@ src/
   trust.ts    workspace-trust dialog detection and the opt-in ~/.claude.json edit
   jobs.ts     in-memory create and local-run jobs (ids, status, retention)
   children.ts registry of child processes: process groups, cancel scopes, shutdown
+  http.ts     opt-in Streamable HTTP transport: Host/Origin checks, bearer token, stateless per-request servers
   config.ts   environment variable parsing and validation
 test/
   parse.test.ts        parser unit tests against realistic CLI output
@@ -580,6 +657,7 @@ test/
   trust.test.ts        trust-dialog detection, ~/.claude.json edits, worktree path
   jobs.test.ts         job store: ids, status, retention
   children.test.ts     process groups, scope cancel, stopAll
+  http.test.ts         HTTP transport over real requests: token, Host/Origin, limits, shared jobs, shutdown
   local.test.ts        local roots and cwd checks: symlinks, /var vs /private/var, prefixes
   smoke.test.ts        starts the built server over stdio and exercises every tool
   fixtures/fake-claude.mjs  stand-in CLI used by the smoke test (TTY, trust dialog, teleport, print-mode stream-json)
