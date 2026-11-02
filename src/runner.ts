@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 
+import { cliNotFoundMessage } from "./prereq.js";
+
 /** Per-stream cap on captured output, to bound memory. */
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 /** Grace period between SIGTERM and SIGKILL after a timeout. */
@@ -63,7 +65,7 @@ export const runCli: Runner = (bin, args, timeoutMs, cwd) =>
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
       if (err.code === "ENOENT") {
-        reject(new RunError("CLI_NOT_FOUND", `claude binary not found: ${bin} (set CLAUDE_BIN)`));
+        reject(new RunError("CLI_NOT_FOUND", cliNotFoundMessage(bin)));
       } else {
         reject(new RunError("CLI_SPAWN_FAILED", `failed to start ${bin}: ${err.message}`));
       }

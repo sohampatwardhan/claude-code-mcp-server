@@ -6,7 +6,9 @@
 //   FAKE_CLAUDE_META_LOG   if set, { args, cwd, stdoutIsTTY, stdinIsTTY } is appended
 //   FAKE_CLAUDE_STDIN_LOG  if set, bytes read while the trust dialog is up are appended
 //   FAKE_CLAUDE_MODE       "fail" -> exit 1 with stderr; "hang" -> never exit;
-//                          "garbled" -> exit 0 with unparseable output
+//                          "garbled" -> exit 0 with unparseable output;
+//                          "signed_out" -> every command fails like a CLI with no login
+//                          (auth status prints loggedIn false and exits 1)
 //   FAKE_CLAUDE_TRUST      "prompt" -> create always shows the trust dialog
 //                          "file"   -> create shows it unless ~/.claude.json trusts this checkout
 //                          unset    -> create does not ask (folder already trusted)
@@ -51,7 +53,14 @@ const isCreate = () => args[0]?.startsWith("--cloud=") === true && !args.include
 if (mode === "hang") {
   setInterval(() => {}, 1_000);
 } else if (mode === "fail") {
-  process.stderr.write("Error: Unable to create cloud session: not signed in\n");
+  process.stderr.write("Error: Unable to create cloud session: environment unavailable\n");
+  process.exit(1);
+} else if (mode === "signed_out") {
+  if (args[0] === "auth" && args[1] === "status") {
+    process.stdout.write(JSON.stringify({ loggedIn: false, authMethod: "none", apiProvider: "firstParty" }, null, 2) + "\n");
+  } else {
+    process.stderr.write("Invalid API key \u00b7 Please run /login\n");
+  }
   process.exit(1);
 } else if (mode === "garbled") {
   process.stdout.write("something unexpected happened\n");

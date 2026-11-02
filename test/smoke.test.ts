@@ -46,6 +46,10 @@ async function connect(extraEnv: Record<string, string> = {}) {
 
   const transport = new StdioClientTransport({ command: process.execPath, args: [serverEntry], env, stderr: "pipe" });
   const client = new Client({ name: "smoke-test", version: "0.0.0" });
+  let stderrText = "";
+  transport.stderr?.on("data", (chunk: Buffer) => {
+    stderrText += chunk.toString("utf8");
+  });
   await client.connect(transport);
   const argvCalls = (): string[][] => {
     try {
@@ -72,7 +76,7 @@ async function connect(extraEnv: Record<string, string> = {}) {
       return Buffer.alloc(0);
     }
   };
-  return { client, argvCalls, metaCalls, stdinBytes, close: () => client.close() };
+  return { client, argvCalls, metaCalls, stdinBytes, stderr: () => stderrText, close: () => client.close() };
 }
 
 function git(args: string[], cwd?: string): void {
@@ -164,6 +168,7 @@ describe("stdio smoke test", () => {
       assert.match(client.getInstructions() ?? "", /can't push its branch to GitHub/);
       assert.match(client.getInstructions() ?? "", /git format-patch/);
       assert.match(client.getInstructions() ?? "", /claude_get_session/);
+      assert.match(client.getInstructions() ?? "", /npm install -g @anthropic-ai\/claude-code/);
       assert.doesNotMatch(client.getInstructions() ?? "", /no status tool/);
       assert.match(byName.claude_create_cloud_session?.description ?? "", /git format-patch/);
       assert.match(byName.claude_send_followup?.description ?? "", /git format-patch/);
@@ -310,7 +315,7 @@ describe("stdio smoke test", () => {
       })) as CallToolResult;
       const body = errorBody(result);
       assert.equal(body.error.code, "CLI_EXIT_NONZERO");
-      assert.match(body.error.message, /Unable to create cloud session: not signed in/);
+      assert.match(body.error.message, /Unable to create cloud session: environment unavailable/);
     } finally {
       await close();
     }
@@ -351,6 +356,8 @@ describe("stdio smoke test", () => {
     try {
       const result = (await client.callTool({ name: "claude_auth_status", arguments: {} })) as CallToolResult;
       assert.equal(errorBody(result).error.code, "CLI_NOT_FOUND");
+      assert.match(errorBody(result).error.message, /npm install -g @anthropic-ai\/claude-code/);
+      assert.match(errorBody(result).error.message, /run `claude` once to sign in/);
     } finally {
       await close();
     }
@@ -364,6 +371,38 @@ describe("stdio smoke test", () => {
         arguments: { description: "x" },
       })) as CallToolResult;
       assert.equal(errorBody(result).error.code, "CLI_NOT_FOUND");
+      assert.match(errorBody(result).error.message, /npm install -g @anthropic-ai\/claude-code/);
+    } finally {
+      await close();
+    }
+  });
+
+  it("tells the caller to sign in with claude when the CLI has no login", async () => {
+    const { client, close } = await connect({ FAKE_CLAUDE_MODE: "signed_out" });
+    try {
+      const calls: Array<[string, Record<string, unknown>]> = [
+        ["claude_create_cloud_session", { description: "x" }],
+        ["claude_send_followup", { session: "session_01FakeSessionId0000000000", message: "hi" }],
+        ["claude_auth_status", {}],
+      ];
+      for (const [name, args] of calls) {
+        const result = (await client.callTool({ name, arguments: args })) as CallToolResult;
+        const body = errorBody(result);
+        assert.equal(body.error.code, "CLI_NOT_SIGNED_IN", name);
+        assert.match(body.error.message, /Sign in with `claude` first/, name);
+        assert.match(body.error.message, /Claude GitHub app/, name);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  it("warns on stderr at startup when the claude binary is missing", async () => {
+    const { client, close, stderr } = await connect({ CLAUDE_BIN: join(tmp, "missing-at-startup") });
+    try {
+      await client.listTools();
+      assert.match(stderr(), /warning: Claude Code CLI not found: .*missing-at-startup/);
+      assert.match(stderr(), /npm install -g @anthropic-ai\/claude-code/);
     } finally {
       await close();
     }

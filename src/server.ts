@@ -7,6 +7,7 @@ import { z } from "zod";
 
 import { authStatusArgv, createSessionArgv, sendFollowupArgv, teleportArgv } from "./argv.js";
 import { ENVIRONMENT_ID_PATTERN, type Config } from "./config.js";
+import { cliNotFoundMessage, isSignInError, signInMessage } from "./prereq.js";
 import { runCliPty, type PtyRunResult } from "./pty.js";
 import {
   AuthParseError,
@@ -43,7 +44,10 @@ export const SERVER_VERSION = "0.1.0";
 
 /** Server-level guidance sent to clients in the initialize result. */
 export const SERVER_INSTRUCTIONS =
-  "Starts and drives Claude Code cloud sessions. Check results with claude_get_session, which reports the " +
+  "Starts and drives Claude Code cloud sessions. Requires the Claude Code CLI on this machine, installed with " +
+  "`npm install -g @anthropic-ai/claude-code` and signed in by running `claude` once (claude_auth_status checks " +
+  "this). CLI_NOT_FOUND and CLI_NOT_SIGNED_IN errors say which step is missing.\n\n" +
+  "Check results with claude_get_session, which reports the " +
   "branch a session pushed and any pull request it opened; the conversation and replies are only visible at " +
   "the session's session_url.\n\n" +
   "If a cloud session can't push its branch to GitHub (claude_get_session finds no branch, or the session " +
@@ -73,7 +77,8 @@ export type ErrorCode =
   | "WORKSPACE_NOT_TRUSTED"
   | "REPO_NOT_ALLOWED"
   | "REPO_PREPARE_FAILED"
-  | "SESSION_REPO_UNKNOWN";
+  | "SESSION_REPO_UNKNOWN"
+  | "CLI_NOT_SIGNED_IN";
 
 // ---- schemas -------------------------------------------------------------
 
@@ -235,9 +240,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       return toolError("CLI_TIMEOUT", `claude timed out after ${config.timeoutMs} ms`, args, result);
     }
     if (result.exitCode !== 0) {
-      const how = result.exitCode === null ? `was killed by ${result.signal}` : `exited with code ${result.exitCode}`;
-      const detail = outputDetail(result);
-      return toolError("CLI_EXIT_NONZERO", `claude ${how}${detail ? `: ${detail}` : ""}`, args, result);
+      return exitError(result, args);
     }
     return result;
   }
@@ -271,15 +274,13 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     if (result.exitCode === 127 && cleanTerminalText(result.stdout).includes("claude binary not found:")) {
       return toolError(
         "CLI_NOT_FOUND",
-        `claude binary not found: ${config.claudeBin} (set CLAUDE_BIN)`,
+        cliNotFoundMessage(config.claudeBin),
         args,
         result,
       );
     }
     if (result.exitCode !== 0) {
-      const how = result.exitCode === null ? `was killed by ${result.signal}` : `exited with code ${result.exitCode}`;
-      const detail = outputDetail(result);
-      return toolError("CLI_EXIT_NONZERO", `claude ${how}${detail ? `: ${detail}` : ""}`, args, result);
+      return exitError(result, args);
     }
     return result;
   }
@@ -520,10 +521,9 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     if (branch === null && result.exitCode !== 0) {
       const how = result.exitCode === null ? `was killed by ${result.signal}` : `exited with code ${result.exitCode}`;
       const detail = parsed.notes.find((line) => line.startsWith("Teleport")) ?? outputDetail(result);
-      return toolError("CLI_EXIT_NONZERO", `claude ${how}${detail ? `: ${detail}` : ""}`, args, {
-        ...result,
-        stderr: [result.stderr, ...parsed.notes].filter((line) => line !== "").join("\n"),
-      });
+      const withNotes = { ...result, stderr: [result.stderr, ...parsed.notes].filter((line) => line !== "").join("\n") };
+      if (signedOut(withNotes)) return toolError("CLI_NOT_SIGNED_IN", signInMessage(detail), args, withNotes);
+      return toolError("CLI_EXIT_NONZERO", `claude ${how}${detail ? `: ${detail}` : ""}`, args, withNotes);
     }
     const stderr = [cleanTerminalText(result.stderr).trim(), ...parsed.notes].filter((line) => line !== "").join("\n");
     return ok({
@@ -545,7 +545,10 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     "claude_auth_status",
     {
       title: "Claude Code auth status",
-      description: "Report whether the local Claude Code CLI is signed in, via `claude auth status`.",
+      description:
+        "Report whether the local Claude Code CLI is signed in, via `claude auth status`. If it is not, sign in " +
+        "with `claude` first (run it once in a terminal and complete the claude.ai login). A missing CLI returns " +
+        "CLI_NOT_FOUND with the install command (`npm install -g @anthropic-ai/claude-code`).",
       inputSchema: authInput,
       outputSchema: authOutput,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -582,6 +585,18 @@ function trustMessage(projectPath: string): string {
 
 function isRunResult(value: RunResult | PtyRunResult | CallToolResult): value is RunResult {
   return "timedOut" in value;
+}
+
+/** A non-zero exit: CLI_NOT_SIGNED_IN when the output reads like a login problem, else CLI_EXIT_NONZERO. */
+function exitError(result: RunResult, args: string[]): CallToolResult {
+  const how = result.exitCode === null ? `was killed by ${result.signal}` : `exited with code ${result.exitCode}`;
+  const detail = outputDetail(result);
+  if (signedOut(result)) return toolError("CLI_NOT_SIGNED_IN", signInMessage(detail), args, result);
+  return toolError("CLI_EXIT_NONZERO", `claude ${how}${detail ? `: ${detail}` : ""}`, args, result);
+}
+
+function signedOut(result: RunResult): boolean {
+  return isSignInError(`${cleanTerminalText(result.stderr)}\n${cleanTerminalText(result.stdout)}`);
 }
 
 function outputDetail(result: RunResult): string {

@@ -2,6 +2,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 import { ConfigError, loadConfig } from "./config.js";
+import { cliNotFoundMessage, findCli } from "./prereq.js";
 import { createServer } from "./server.js";
 
 async function main(): Promise<void> {
@@ -14,6 +15,10 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     throw err;
+  }
+  if (findCli(config.claudeBin, process.env, config.cwd) === null) {
+    // Keep serving: tool calls return CLI_NOT_FOUND with the same message.
+    process.stderr.write(`claude-code-mcp-server: warning: ${cliNotFoundMessage(config.claudeBin)}\n`);
   }
   const server = createServer(config);
   await server.connect(new StdioServerTransport());
