@@ -19,23 +19,79 @@ It exposes three tools over stdio: create a cloud session, queue a follow-up mes
 - The [Claude Code CLI](https://code.claude.com/docs), installed and signed in (`claude auth status` should report `"loggedIn": true`), with cloud sessions available on your account
 - Python 3 (the standard library only: `pty`, `fcntl`, `termios`) for `claude_create_cloud_session`. No pip packages. Follow-ups and auth status do not need Python. On Debian/Ubuntu this is the `python3` package, which is usually already installed.
 
-## Install and build
+## Install
+
+The package on npm is `@sohampatwardhan/claude-code-mcp-server`. Orchestrator agents start it over stdio:
 
 ```sh
-git clone <this repo> claude-code-mcp-server
-cd claude-code-mcp-server
-npm install
-npm run build
-npm test        # unit tests + stdio smoke test (uses a fake CLI; creates no sessions)
+npx -y @sohampatwardhan/claude-code-mcp-server@latest
+```
+
+The published bin is `claude-code-mcp-server` (`#!/usr/bin/env node`). Stdio is the only transport. Logs go to stderr so they stay off the JSON-RPC stream. The MCP server name is `claude-code-mcp-server`.
+
+The client must be able to run the Claude Code CLI. Install it and sign in on the same machine (`claude auth status` should report `"loggedIn": true`), with cloud sessions available on the account. Python 3 (stdlib only) is required for `claude_create_cloud_session`. See [Prerequisites](#prerequisites).
+
+`claude --cloud` packages the working directory. Set the client's `cwd` to the repository the session should work on, or set `CLAUDE_MCP_CWD` when the host can pass environment variables but not a working directory. The full list is in [Environment variables](#environment-variables).
+
+### Cursor
+
+Add this to `~/.cursor/mcp.json` or the project's `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "claude-code": {
+      "command": "npx",
+      "args": ["-y", "@sohampatwardhan/claude-code-mcp-server@latest"],
+      "cwd": "/absolute/path/to/the/repo/sessions/should/work/on",
+      "env": {
+        "CLAUDE_MCP_CWD": "/absolute/path/to/the/repo/sessions/should/work/on"
+      }
+    }
+  }
+}
+```
+
+`cwd` and `CLAUDE_MCP_CWD` should be the same directory. If the client has no `cwd` field, `CLAUDE_MCP_CWD` alone is enough.
+
+### Claude Desktop
+
+The same `mcpServers` block goes in the desktop config:
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- Linux: `~/.config/Claude/claude_desktop_config.json`
+
+Restart Claude Desktop after saving. Point `cwd` / `CLAUDE_MCP_CWD` at the repository the cloud session should package.
+
+### Generic stdio
+
+Any MCP client that launches a local process uses the same command. Field names vary (`mcpServers` vs `servers`, and some clients omit `type`).
+
+```json
+{
+  "mcpServers": {
+    "claude-code": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@sohampatwardhan/claude-code-mcp-server@latest"],
+      "env": {
+        "CLAUDE_MCP_CWD": "/absolute/path/to/your/repo",
+        "CLAUDE_BIN": "claude",
+        "CLAUDE_MCP_TIMEOUT_MS": "300000"
+      }
+    }
+  }
+}
 ```
 
 ## Run
 
+The server speaks MCP over stdin/stdout. Normally the MCP client launches it, so you don't run it by hand. From a checkout, after `npm run build`:
+
 ```sh
 npm start                       # same as: node dist/src/index.js
 ```
-
-The server speaks MCP over stdin/stdout. Normally the MCP client launches it, so you don't run it by hand.
 
 ### Environment variables
 
@@ -205,40 +261,16 @@ Schema violations (a missing required field, an unknown property, a value that d
 
 ## Client configuration
 
-The server uses standard MCP stdio, so any client that accepts an `mcpServers`-style stdio entry can launch it. Use absolute paths, since clients usually launch servers from their own working directory.
-
-### Generic MCP stdio config
+Cursor, Claude Desktop, and a generic stdio entry are in [Install](#install). The same `npx` command is what Muse, Grok, and other orchestrators should launch. Pass `CLAUDE_CLOUD_ENVIRONMENT_ID` when every create should target one cloud environment:
 
 ```json
 {
   "mcpServers": {
     "claude-code": {
-      "command": "node",
-      "args": ["/absolute/path/to/claude-code-mcp-server/dist/src/index.js"],
-      "cwd": "/absolute/path/to/the/repo/sessions/should/work/on",
+      "command": "npx",
+      "args": ["-y", "@sohampatwardhan/claude-code-mcp-server@latest"],
       "env": {
-        "CLAUDE_BIN": "claude",
-        "CLAUDE_MCP_TIMEOUT_MS": "300000"
-      }
-    }
-  }
-}
-```
-
-If you've installed the package globally (`npm install -g .` from this repo), you can use `"command": "claude-code-mcp-server"` with `"args": []` instead.
-
-### Muse
-
-Add the server as a stdio MCP server in Muse's MCP server configuration:
-
-```json
-{
-  "mcpServers": {
-    "claude-code": {
-      "command": "node",
-      "args": ["/absolute/path/to/claude-code-mcp-server/dist/src/index.js"],
-      "cwd": "/absolute/path/to/your/repo",
-      "env": {
+        "CLAUDE_MCP_CWD": "/absolute/path/to/your/repo",
         "CLAUDE_CLOUD_ENVIRONMENT_ID": "ccpool_your_environment_id"
       }
     }
@@ -246,28 +278,17 @@ Add the server as a stdio MCP server in Muse's MCP server configuration:
 }
 ```
 
-### Grok and other MCP clients
-
-Any MCP client that can launch a local stdio server uses the command (`node`), the args (the path to `dist/src/index.js`), and optional env vars. When the client has no `cwd` field, set `CLAUDE_MCP_CWD` to the repository the cloud sessions should package. For example:
-
-```json
-{
-  "mcpServers": {
-    "claude-code": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/absolute/path/to/claude-code-mcp-server/dist/src/index.js"],
-      "env": {
-        "CLAUDE_MCP_CWD": "/absolute/path/to/your/repo"
-      }
-    }
-  }
-}
-```
-
-Field names vary slightly between clients (some leave out `type`, and some call the map `servers`). Check your client's MCP documentation for the exact config file location and keys.
+A global install (`npm install -g @sohampatwardhan/claude-code-mcp-server`) exposes the same bin as `"command": "claude-code-mcp-server"` with `"args": []`.
 
 ## Development
+
+```sh
+git clone https://github.com/sohampatwardhan/claude-code-mcp-server.git
+cd claude-code-mcp-server
+npm install
+npm run build
+npm test        # unit tests + stdio smoke test (uses a fake CLI; creates no sessions)
+```
 
 ```text
 src/
@@ -286,6 +307,47 @@ test/
   smoke.test.ts        starts the built server over stdio and exercises every tool
   fixtures/fake-claude.mjs  stand-in CLI used by the smoke test (TTY and trust dialog)
 ```
+
+`prepack` compiles TypeScript into `dist/` and marks `dist/src/index.js` executable before the package is packed. CI runs `npm ci`, then `npm run build` and `npm test`.
+
+## Releasing
+
+The owner publishes `0.1.0` once from a maintainer machine. Trusted publishing on npmjs.com can be saved only after that package exists. Later versions then publish from the tag workflow. Skip the `v0.1.0` tag for this bootstrap: the workflow would try to publish `0.1.0` again.
+
+```sh
+npm login
+npm ci
+npm publish --access public
+```
+
+Leave `--provenance` off for that local publish. Provenance is added by the GitHub Actions workflow, which has the OIDC token.
+
+On npmjs.com, open `@sohampatwardhan/claude-code-mcp-server` → Settings → Trusted publishing (the section is also labeled Trusted Publisher). Choose GitHub Actions and enter:
+
+| Field | Value |
+| --- | --- |
+| Organization or user | `sohampatwardhan` |
+| Repository | `claude-code-mcp-server` |
+| Workflow filename | `release.yml` |
+| Environment name | empty |
+
+The filename is `release.yml` only, not `.github/workflows/release.yml`. Allow direct `npm publish`. A publisher created after 3 September 2026 starts with `npm stage publish` allowed and does not allow `npm publish` until that action is selected. Leave dist-tag management off. The same link can be created with npm CLI 11.15.0 or newer:
+
+```sh
+npm trust github @sohampatwardhan/claude-code-mcp-server \
+  --repo sohampatwardhan/claude-code-mcp-server \
+  --file release.yml \
+  --allow-publish
+```
+
+The first successful publish from that workflow has to happen within two days of saving the publisher, or the configuration expires. Cut the next version for that check:
+
+```sh
+npm version patch   # or minor, or major
+git push --follow-tags
+```
+
+`npm version` writes the version and a `vX.Y.Z` tag. `.github/workflows/release.yml` runs on that tag (and on a manual run that names the tag). It refuses the job when the tag is not `v` plus `package.json` `"version"`, then runs `npm ci`, build, and test, publishes with `npm publish --provenance --access public`, and opens a GitHub Release with generated notes. Trusted publishing authenticates that step with GitHub OIDC.
 
 ## License
 
