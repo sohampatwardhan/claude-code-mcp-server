@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { authStatusArgv, createSessionArgv, sendFollowupArgv } from "../src/argv.js";
+import { authStatusArgv, createSessionArgv, sendFollowupArgv, teleportArgv } from "../src/argv.js";
 import { ConfigError, DEFAULT_TIMEOUT_MS, loadConfig } from "../src/config.js";
 
 const tmp = mkdtempSync(join(tmpdir(), "claude-mcp-config-"));
@@ -34,6 +34,17 @@ describe("argv construction", () => {
   it("builds auth argv", () => {
     assert.deepEqual(authStatusArgv(), ["auth", "status"]);
   });
+
+  it("builds print-mode teleport argv and rejects a non-session id", () => {
+    assert.deepEqual(teleportArgv("session_01ABCDEFGH", "/tmp/claude-mcp/session_01ABCDEFGH.teleport.log"), [
+      "--teleport=session_01ABCDEFGH",
+      "--debug",
+      "--debug-file=/tmp/claude-mcp/session_01ABCDEFGH.teleport.log",
+    ]);
+    assert.throws(() => teleportArgv("--help", "/tmp/x.log"));
+    assert.throws(() => teleportArgv("session_01ABCDEFGH", "relative.log"));
+    assert.throws(() => teleportArgv("https://claude.ai/code/session_01ABCDEFGH", "/tmp/x.log"));
+  });
 });
 
 describe("loadConfig", () => {
@@ -45,6 +56,8 @@ describe("loadConfig", () => {
       trustCwd: false,
       pythonBin: "python3",
       cwd: process.cwd(),
+      repos: [],
+      repoCache: resolve(homedir(), ".claude-mcp", "repos"),
     });
   });
 
@@ -57,6 +70,8 @@ describe("loadConfig", () => {
         CLAUDE_MCP_TRUST_CWD: "yes",
         CLAUDE_MCP_PYTHON: "/usr/bin/python3",
         CLAUDE_MCP_CWD: tmp,
+        CLAUDE_MCP_REPOS: `${tmp},acme/widgets`,
+        CLAUDE_MCP_REPO_CACHE: join(tmp, "repo-cache"),
       }),
       {
         claudeBin: "/opt/claude",
@@ -65,6 +80,11 @@ describe("loadConfig", () => {
         trustCwd: true,
         pythonBin: "/usr/bin/python3",
         cwd: resolve(tmp),
+        repos: [
+          { kind: "path", path: realpathSync(tmp) },
+          { kind: "github", slug: "acme/widgets", owner: "acme", name: "widgets" },
+        ],
+        repoCache: resolve(tmp, "repo-cache"),
       },
     );
   });
@@ -93,6 +113,12 @@ describe("loadConfig", () => {
     assert.throws(() => loadConfig({ CLAUDE_CLOUD_ENVIRONMENT_ID: "--rm" }), ConfigError);
     assert.throws(() => loadConfig({ CLAUDE_CLOUD_ENVIRONMENT_ID: "a b" }), ConfigError);
     assert.throws(() => loadConfig({ CLAUDE_MCP_TRUST_CWD: "maybe" }), ConfigError);
+    assert.throws(() => loadConfig({ CLAUDE_MCP_REPOS: "./checkout" }), ConfigError);
+    assert.throws(() => loadConfig({ CLAUDE_MCP_REPOS: "foo/bar/baz" }), ConfigError);
+    assert.throws(() => loadConfig({ CLAUDE_MCP_REPOS: "https://gitlab.com/acme/widgets" }), ConfigError);
+    const file = join(tmp, "cache-file");
+    writeFileSync(file, "x");
+    assert.throws(() => loadConfig({ CLAUDE_MCP_REPO_CACHE: file }), ConfigError);
   });
 
   it("treats an explicit false trust flag as off", () => {

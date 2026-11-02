@@ -1,3 +1,5 @@
+import { isSafeBranchName } from "./repos.js";
+
 /**
  * Parsing of `claude` CLI output into structured fields.
  *
@@ -122,6 +124,68 @@ export interface AuthStatus {
 
 export class AuthParseError extends Error {
   override name = "AuthParseError";
+}
+
+export interface ParsedTeleport {
+  /** Branch named by `Branch after checkout`, when it is a safe branch name. */
+  branch: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  /** Short diagnostic lines. Unrecognised text is ignored. */
+  notes: string[];
+}
+
+/**
+ * Branch and pull request from teleport's debug log or stdout.
+ * Never throws. A pull request URL is kept only when it belongs to `repo`.
+ *
+ * Claude Code 2.1.300 print-mode teleport logs these lines when `--debug` is on:
+ * `Switching to branch '<name>'...` and `Branch after checkout: '<name>'`.
+ */
+export function parseTeleportOutput(text: string, repo: { owner: string; name: string }): ParsedTeleport {
+  const cleaned = cleanTerminalText(text);
+  const after = /Branch after checkout: '([^'\r\n]+)'/.exec(cleaned)?.[1] ?? null;
+  const switching = /Switching to branch '([^'\r\n]+)'/.exec(cleaned)?.[1] ?? null;
+  const labelled = /(?:^|\n)\s*Checking out branch\s+(\S+)/.exec(cleaned)?.[1] ?? null;
+  const branchCandidate = after ?? switching ?? labelled;
+  const branch = branchCandidate !== null && isSafeBranchName(branchCandidate) ? branchCandidate : null;
+
+  const urlMatch = /https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)/.exec(cleaned);
+  const numberMatch = /(?:Opened|Created)\s+PR\s+#(\d{1,9})\b/i.exec(cleaned);
+  const urlOwner = urlMatch?.[1];
+  const urlName = urlMatch?.[2];
+  const urlNumber = urlMatch?.[3];
+  const urlMatchesRepo =
+    urlOwner !== undefined &&
+    urlName !== undefined &&
+    urlNumber !== undefined &&
+    urlOwner.toLowerCase() === repo.owner.toLowerCase() &&
+    urlName.toLowerCase() === repo.name.toLowerCase();
+  let pr_number: number | null = null;
+  let pr_url: string | null = null;
+  const bareNumber = numberMatch?.[1];
+  if (urlMatchesRepo && urlNumber !== undefined) {
+    pr_number = Number(urlNumber);
+    pr_url = `https://github.com/${repo.owner}/${repo.name}/pull/${pr_number}`;
+  } else if (urlMatch === null && bareNumber !== undefined) {
+    pr_number = Number(bareNumber);
+    pr_url = `https://github.com/${repo.owner}/${repo.name}/pull/${pr_number}`;
+  }
+
+  const notes: string[] = [];
+  for (const line of cleaned.split("\n")) {
+    const trimmed = line.trim();
+    if (
+      trimmed.startsWith("Teleport in print mode failed:") ||
+      trimmed.startsWith("Teleport failed:") ||
+      trimmed.startsWith("Invalid branch name from cloud session") ||
+      trimmed.startsWith("Branch after checkout:") ||
+      trimmed.startsWith("Switching to branch ")
+    ) {
+      notes.push(trimmed.slice(0, 500));
+    }
+  }
+  return { branch, pr_number, pr_url, notes };
 }
 
 /** Parses `claude auth status` JSON. Throws AuthParseError if it is not JSON with a boolean `loggedIn`. */

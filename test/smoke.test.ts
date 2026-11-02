@@ -2,7 +2,7 @@
 // CLAUDE_BIN pointed at a fake CLI so no real sessions are created.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
@@ -15,7 +15,9 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const serverEntry = join(root, "dist/src/index.js");
 const fakeClaude = join(root, "test/fixtures/fake-claude.mjs");
+const fakeGh = join(root, "test/fixtures/fake-gh.mjs");
 chmodSync(fakeClaude, 0o755);
+chmodSync(fakeGh, 0o755);
 
 const tmp = mkdtempSync(join(tmpdir(), "claude-mcp-smoke-"));
 after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -73,6 +75,44 @@ async function connect(extraEnv: Record<string, string> = {}) {
   return { client, argvCalls, metaCalls, stdinBytes, close: () => client.close() };
 }
 
+function git(args: string[], cwd?: string): void {
+  execFileSync("git", args, {
+    cwd,
+    stdio: "pipe",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_EMAIL: "dev@example.com",
+      GIT_AUTHOR_NAME: "dev",
+      GIT_COMMITTER_EMAIL: "dev@example.com",
+      GIT_COMMITTER_NAME: "dev",
+    },
+  });
+}
+
+/** Local bare repo that `git clone https://github.com/owner/name.git` resolves to. */
+function githubRewrite(name: string, owner: string, repo: string): { env: Record<string, string> } {
+  const work = join(tmp, `${name}-src`);
+  const bare = join(tmp, `${name}.git`);
+  mkdirSync(work, { recursive: true });
+  git(["init", "-b", "main", work]);
+  writeFileSync(join(work, "README"), "main\n");
+  git(["add", "README"], work);
+  git(["commit", "-m", "main"], work);
+  git(["checkout", "-b", "develop"], work);
+  writeFileSync(join(work, "README"), "develop\n");
+  git(["commit", "-am", "develop"], work);
+  git(["clone", "--bare", work, bare]);
+  const gitconfig = join(tmp, `${name}.gitconfig`);
+  writeFileSync(gitconfig, `[url "${bare}"]\n\tinsteadOf = https://github.com/${owner}/${repo}.git\n`);
+  return { env: { GIT_CONFIG_GLOBAL: gitconfig, GIT_CONFIG_NOSYSTEM: "1" } };
+}
+
+function mkdirWork(name: string): string {
+  const dir = join(tmp, name);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 /** Directory the server will mark trusted for `dir`: main checkout, else `dir`. */
 function expectedTrustPath(dir: string = process.cwd()): string {
   try {
@@ -101,13 +141,14 @@ function errorBody(result: CallToolResult): { error: { code: string; message: st
 }
 
 describe("stdio smoke test", () => {
-  it("lists exactly the three tools, each with a strict input schema", async () => {
+  it("lists exactly the four tools, each with a strict input schema", async () => {
     const { client, close } = await connect();
     try {
       const { tools } = await client.listTools();
       assert.deepEqual(tools.map((t) => t.name).sort(), [
         "claude_auth_status",
         "claude_create_cloud_session",
+        "claude_get_session",
         "claude_send_followup",
       ]);
       for (const tool of tools) {
@@ -117,6 +158,7 @@ describe("stdio smoke test", () => {
       }
       const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
       assert.deepEqual(byName.claude_create_cloud_session?.inputSchema.required, ["description"]);
+      assert.deepEqual(byName.claude_get_session?.inputSchema.required, ["session"]);
       assert.deepEqual(byName.claude_send_followup?.inputSchema.required?.slice().sort(), ["message", "session"]);
       assert.deepEqual(byName.claude_auth_status?.inputSchema.properties, {});
     } finally {
@@ -138,6 +180,9 @@ describe("stdio smoke test", () => {
       assert.equal(s.title, "Fix the flaky test");
       assert.equal(s.parsed, true);
       assert.equal(s.environment_id, null);
+      assert.equal(s.cwd, process.cwd());
+      assert.equal(s.repo, null);
+      assert.equal(s.base_branch, null);
       const cli = s.cli as { stdout: string; stderr: string };
       assert.equal(cli.stderr, "");
       assert.doesNotMatch(cli.stdout, /[\u0000-\u0008\u000e-\u001f]/);
@@ -229,6 +274,13 @@ describe("stdio smoke test", () => {
         { name: "claude_create_cloud_session", arguments: { description: "x", extra: 1 } },
         { name: "claude_create_cloud_session", arguments: { description: "   " } },
         { name: "claude_create_cloud_session", arguments: { description: "x", environment_id: "--bad" } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", repo: "not a repo" } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", repo: "https://gitlab.com/acme/widgets" } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", repo: "https://user:token@github.com/acme/widgets" } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", base_branch: "-rf" } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", base_branch: "a/../../b" } },
+        { name: "claude_get_session", arguments: {} },
+        { name: "claude_get_session", arguments: { session: "session_01ABCDEFGH", repo: "/tmp" } },
         { name: "claude_send_followup", arguments: { session: "--help", message: "hi" } },
         { name: "claude_send_followup", arguments: { session: "session_01ABCDEFGH" } },
         { name: "claude_auth_status", arguments: { verbose: true } },
@@ -321,6 +373,69 @@ describe("stdio smoke test", () => {
       assert.equal(errorBody(created).error.code, "PTY_UNAVAILABLE");
       const auth = (await client.callTool({ name: "claude_auth_status", arguments: {} })) as CallToolResult;
       assert.notEqual(auth.isError, true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("runs create in an allowlisted directory and rejects anything off the list", async () => {
+    const work = realpathSync(mkdirWork("allowed-repo"));
+    const outsider = realpathSync(mkdirWork("outsider"));
+    const { client, argvCalls, metaCalls, close } = await connect({
+      CLAUDE_MCP_REPOS: work,
+    });
+    try {
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "in the allowlisted checkout", repo: work },
+      })) as CallToolResult;
+      assert.notEqual(created.isError, true);
+      const s = created.structuredContent as { cwd: string; repo: string; title: string };
+      assert.equal(s.cwd, work);
+      assert.equal(s.repo, work);
+      assert.equal(s.title, "in the allowlisted checkout");
+      assert.equal(metaCalls()[0]?.cwd, work);
+
+      const denied = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "nope", repo: outsider },
+      })) as CallToolResult;
+      assert.equal(errorBody(denied).error.code, "REPO_NOT_ALLOWED");
+      const localBranch = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "nope", repo: work, base_branch: "develop" },
+      })) as CallToolResult;
+      assert.equal(errorBody(localBranch).error.code, "REPO_PREPARE_FAILED");
+      assert.deepEqual(argvCalls(), [["--cloud=in the allowlisted checkout"]]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("trusts the allowlisted directory the session is created from", async () => {
+    const work = realpathSync(mkdirWork("trust-repo"));
+    const home = join(tmp, "home-repo");
+    mkdirSync(home);
+    const { client, close } = await connect({
+      HOME: home,
+      CLAUDE_MCP_CWD: work,
+      CLAUDE_MCP_REPOS: `${work},${process.cwd()}`,
+      CLAUDE_MCP_TRUST_CWD: "1",
+      FAKE_CLAUDE_TRUST: "file",
+    });
+    try {
+      const other = realpathSync(process.cwd());
+      const result = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "trust this repo", repo: other },
+      })) as CallToolResult;
+      assert.notEqual(result.isError, true);
+      const saved = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")) as {
+        projects: Record<string, { hasTrustDialogAccepted?: boolean }>;
+      };
+      const trusted = expectedTrustPath(other);
+      assert.equal(saved.projects[trusted]?.hasTrustDialogAccepted, true);
+      if (trusted !== expectedTrustPath(work)) assert.equal(saved.projects[expectedTrustPath(work)], undefined);
     } finally {
       await close();
     }
@@ -435,6 +550,177 @@ describe("stdio smoke test", () => {
         projects: Record<string, { hasTrustDialogAccepted?: boolean }>;
       };
       assert.equal(saved.projects[expectedTrustPath()]?.hasTrustDialogAccepted, true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("clones any github.com repository and reports the session branch and pull request", async () => {
+    const cache = join(tmp, "repo-cache");
+    const rewrite = githubRewrite("widgets", "acme", "widgets");
+    const session = "session_01FakeSessionId0000000000";
+    const { client, argvCalls, metaCalls, close } = await connect({
+      CLAUDE_MCP_REPO_CACHE: cache,
+      ...rewrite.env,
+      FAKE_TELEPORT_BRANCH: "claude/session-branch",
+      FAKE_TELEPORT_PR_NUMBER: "17",
+      FAKE_TELEPORT_PR_URL: "https://github.com/acme/widgets/pull/17",
+    });
+    try {
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "ship the widget", repo: "acme/widgets", base_branch: "develop" },
+      })) as CallToolResult;
+      assert.notEqual(created.isError, true);
+      const createdBody = created.structuredContent as {
+        cwd: string;
+        repo: string;
+        base_branch: string;
+        session_id: string;
+      };
+      assert.equal(createdBody.repo, "acme/widgets");
+      assert.equal(createdBody.base_branch, "develop");
+      assert.equal(createdBody.session_id, session);
+      assert.equal(readFileSync(join(createdBody.cwd, "README"), "utf8"), "develop\n");
+      assert.equal(
+        execFileSync("git", ["config", "--get", "remote.origin.url"], { cwd: createdBody.cwd, encoding: "utf8" }).trim(),
+        "https://github.com/acme/widgets.git",
+      );
+      assert.equal(metaCalls()[0]?.cwd, createdBody.cwd);
+      assert.deepEqual(argvCalls()[0], ["--cloud=ship the widget"]);
+      const record = JSON.parse(readFileSync(join(cache, "sessions", `${session}.json`), "utf8")) as {
+        repo: string;
+        base_branch: string;
+      };
+      assert.equal(record.repo, "acme/widgets");
+      assert.equal(record.base_branch, "develop");
+
+      const status = (await client.callTool({
+        name: "claude_get_session",
+        arguments: { session },
+      })) as CallToolResult;
+      assert.notEqual(status.isError, true);
+      const body = status.structuredContent as {
+        repo: string;
+        branch: string;
+        base_branch: string;
+        pr_number: number;
+        pr_url: string;
+        pr_source: string;
+        pr_error: string | null;
+        parsed: boolean;
+        args: string[];
+      };
+      assert.equal(body.repo, "acme/widgets");
+      assert.equal(body.branch, "claude/session-branch");
+      assert.equal(body.base_branch, "develop");
+      assert.equal(body.pr_number, 17);
+      assert.equal(body.pr_url, "https://github.com/acme/widgets/pull/17");
+      assert.equal(body.pr_source, "output");
+      assert.equal(body.pr_error, null);
+      assert.equal(body.parsed, true);
+      assert.deepEqual(body.args, [
+        `--teleport=${session}`,
+        "--debug",
+        `--debug-file=${join(cache, "sessions", `${session}.teleport.log`)}`,
+      ]);
+      assert.equal(metaCalls()[1]?.stdoutIsTTY, false);
+      assert.equal(metaCalls()[1]?.cwd, createdBody.cwd);
+      assert.equal(
+        execFileSync("git", ["symbolic-ref", "--short", "HEAD"], { cwd: createdBody.cwd, encoding: "utf8" }).trim(),
+        "claude/session-branch",
+      );
+    } finally {
+      await close();
+    }
+  });
+
+  it("reads the pull request with gh when teleport does not print one", async () => {
+    const cache = join(tmp, "repo-cache-gh");
+    const rewrite = githubRewrite("widgets-gh", "acme", "widgets");
+    const ghDir = join(tmp, "gh-bin");
+    const ghLog = join(tmp, "gh-argv.jsonl");
+    mkdirSync(ghDir);
+    symlinkSync(fakeGh, join(ghDir, "gh"));
+    const session = "session_01FakeSessionId0000000000";
+    const { client, close } = await connect({
+      CLAUDE_MCP_REPO_CACHE: cache,
+      PATH: `${ghDir}:${process.env.PATH ?? ""}`,
+      FAKE_TELEPORT_MODE: "silent",
+      FAKE_TELEPORT_BRANCH: "claude/session-branch",
+      FAKE_GH_ARGV_LOG: ghLog,
+      FAKE_GH_REPO: "acme/widgets",
+      FAKE_GH_BRANCH: "claude/session-branch",
+      FAKE_GH_PR_NUMBER: "21",
+      FAKE_GH_PR_URL: "https://github.com/acme/widgets/pull/21",
+      ...rewrite.env,
+    });
+    try {
+      const status = (await client.callTool({
+        name: "claude_get_session",
+        arguments: { session, repo: "https://github.com/acme/widgets.git" },
+      })) as CallToolResult;
+      assert.notEqual(status.isError, true);
+      const body = status.structuredContent as {
+        repo: string;
+        branch: string;
+        pr_number: number;
+        pr_url: string;
+        pr_source: string;
+      };
+      assert.equal(body.repo, "acme/widgets");
+      assert.equal(body.branch, "claude/session-branch");
+      assert.equal(body.pr_number, 21);
+      assert.equal(body.pr_url, "https://github.com/acme/widgets/pull/21");
+      assert.equal(body.pr_source, "gh");
+      assert.deepEqual(JSON.parse(readFileSync(ghLog, "utf8")) as string[], [
+        "pr",
+        "list",
+        "--repo",
+        "acme/widgets",
+        "--head",
+        "claude/session-branch",
+        "--state",
+        "all",
+        "--json",
+        "number,url",
+        "--limit",
+        "1",
+      ]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("reports a teleport failure without a branch and a session with no recorded repository", async () => {
+    const cache = join(tmp, "repo-cache-fail");
+    const rewrite = githubRewrite("widgets-fail", "acme", "widgets");
+    const { client, argvCalls, close } = await connect({
+      CLAUDE_MCP_REPO_CACHE: cache,
+      FAKE_TELEPORT_MODE: "fail",
+      ...rewrite.env,
+    });
+    try {
+      const missing = (await client.callTool({
+        name: "claude_get_session",
+        arguments: { session: "session_01NoRecord00000000000" },
+      })) as CallToolResult;
+      assert.equal(errorBody(missing).error.code, "SESSION_REPO_UNKNOWN");
+
+      const failed = (await client.callTool({
+        name: "claude_get_session",
+        arguments: { session: "session_01FakeSessionId0000000000", repo: "acme/widgets" },
+      })) as CallToolResult;
+      const body = errorBody(failed);
+      assert.equal(body.error.code, "CLI_EXIT_NONZERO");
+      assert.match(body.error.message, /Teleport in print mode failed/);
+      const absent = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "missing branch", repo: "acme/widgets", base_branch: "feature/absent" },
+      })) as CallToolResult;
+      assert.equal(errorBody(absent).error.code, "REPO_PREPARE_FAILED");
+      assert.match(errorBody(absent).error.message, /feature\/absent/);
+      assert.deepEqual(argvCalls(), [["--teleport=session_01FakeSessionId0000000000", "--debug", `--debug-file=${join(cache, "sessions", "session_01FakeSessionId0000000000.teleport.log")}`]]);
     } finally {
       await close();
     }

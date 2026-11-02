@@ -4,8 +4,10 @@
  * half-valid configuration.
  */
 
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+
+import { defaultRepoCache, parseAllowlist, type AllowEntry } from "./repos.js";
 
 export const DEFAULT_TIMEOUT_MS = 300_000;
 
@@ -28,10 +30,18 @@ export interface Config {
   /** Python 3 interpreter used to allocate the pty for `claude --cloud`. */
   pythonBin: string;
   /**
-   * Directory the CLI runs in. `claude --cloud` packages this tree, and
-   * workspace trust is keyed from it.
+   * Directory the CLI runs in when a call omits `repo`. `claude --cloud`
+   * packages this tree, and workspace trust is keyed from it.
    */
   cwd: string;
+  /**
+   * Absolute directories a create call may select. github.com owner/name
+   * entries are accepted here for compatibility and are not required: any
+   * github.com repository may be cloned into `repoCache`.
+   */
+  repos: AllowEntry[];
+  /** Directory that holds checkouts of GitHub repositories named by a call. */
+  repoCache: string;
 }
 
 export class ConfigError extends Error {
@@ -62,6 +72,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const trustCwd = parseBooleanFlag("CLAUDE_MCP_TRUST_CWD", env.CLAUDE_MCP_TRUST_CWD);
   const pythonBin = (env.CLAUDE_MCP_PYTHON ?? "").trim() || "python3";
   const cwd = resolveCwd(env.CLAUDE_MCP_CWD);
+  let repos: AllowEntry[];
+  try {
+    repos = parseAllowlist(env.CLAUDE_MCP_REPOS);
+  } catch (err) {
+    throw new ConfigError(err instanceof Error ? err.message : String(err));
+  }
+  const repoCache = resolveRepoCache(env.CLAUDE_MCP_REPO_CACHE);
 
   return {
     claudeBin,
@@ -70,6 +87,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     trustCwd,
     pythonBin,
     cwd,
+    repos,
+    repoCache,
   };
 }
 
@@ -88,6 +107,23 @@ function resolveCwd(raw: string | undefined): string {
     throw new ConfigError(`CLAUDE_MCP_CWD is not a directory: ${JSON.stringify(cwd)}`);
   }
   return cwd;
+}
+
+/** Unset or blank uses `~/.claude-mcp/repos`. An existing path must be a directory. */
+function resolveRepoCache(raw: string | undefined): string {
+  const trimmed = (raw ?? "").trim();
+  const cache = trimmed === "" ? defaultRepoCache() : resolve(trimmed);
+  if (!existsSync(cache)) return cache;
+  let info;
+  try {
+    info = statSync(cache);
+  } catch {
+    throw new ConfigError(`CLAUDE_MCP_REPO_CACHE does not exist: ${JSON.stringify(cache)}`);
+  }
+  if (!info.isDirectory()) {
+    throw new ConfigError(`CLAUDE_MCP_REPO_CACHE is not a directory: ${JSON.stringify(cache)}`);
+  }
+  return cache;
 }
 
 /** Empty means false. `1` / `true` / `yes` (any case) mean true. */
