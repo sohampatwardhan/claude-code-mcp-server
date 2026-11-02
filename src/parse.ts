@@ -254,3 +254,150 @@ function labelled(text: string, label: string, extract: (s: string) => string | 
   const raw = labelledRaw(text, label);
   return raw === null ? null : extract(raw);
 }
+
+// ---- local runs (`claude -p --output-format=stream-json`) ----------------
+
+const LOCAL_SESSION_ID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/** Longest stream-json line kept; a longer one is skipped rather than buffered. */
+const MAX_STREAM_LINE_CHARS = 8 * 1024 * 1024;
+
+/** Characters of the final result text kept. */
+const MAX_RESULT_CHARS = 100_000;
+
+export interface LocalUsage {
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_creation_input_tokens: number | null;
+  cache_read_input_tokens: number | null;
+}
+
+/** Fields read from the final `{"type":"result"}` line. */
+export interface LocalResult {
+  subtype: string | null;
+  is_error: boolean;
+  result: string | null;
+  num_turns: number | null;
+  total_cost_usd: number | null;
+  usage: LocalUsage | null;
+  /** Names of tools whose calls were denied. */
+  permission_denials: string[];
+  errors: string[];
+}
+
+/**
+ * Incremental reader for print-mode stream-json. It keeps only the session
+ * id, a count of assistant messages, and the final result line, so memory
+ * stays bounded however long the transcript gets. Lines that are not JSON
+ * objects are ignored. Never throws.
+ */
+export class LocalStreamParser {
+  sessionId: string | null = null;
+  assistantMessages = 0;
+  result: LocalResult | null = null;
+  private partial = "";
+  private skipping = false;
+
+  push(chunk: string): void {
+    let text = chunk;
+    for (;;) {
+      const newline = text.indexOf("\n");
+      if (newline === -1) break;
+      const line = this.partial + text.slice(0, newline);
+      text = text.slice(newline + 1);
+      this.partial = "";
+      if (this.skipping) this.skipping = false;
+      else this.line(line);
+    }
+    if (this.skipping) return;
+    this.partial += text;
+    if (this.partial.length > MAX_STREAM_LINE_CHARS) {
+      this.partial = "";
+      this.skipping = true;
+    }
+  }
+
+  /** Flush a last line that had no trailing newline. */
+  end(): void {
+    if (!this.skipping && this.partial !== "") this.line(this.partial);
+    this.partial = "";
+    this.skipping = false;
+  }
+
+  private line(raw: string): void {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith("{")) return;
+    let value: unknown;
+    try {
+      value = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
+    if (!isRecord(value)) return;
+    const sessionId = value.session_id;
+    if (typeof sessionId === "string" && LOCAL_SESSION_ID.test(sessionId)) {
+      // The result line names the session to resume, so it wins over earlier lines.
+      if (this.sessionId === null || value.type === "result") this.sessionId = sessionId;
+    }
+    if (value.type === "assistant") this.assistantMessages++;
+    if (value.type === "result") this.result = localResult(value);
+  }
+}
+
+function localResult(value: Record<string, unknown>): LocalResult {
+  const result = typeof value.result === "string" ? value.result.slice(0, MAX_RESULT_CHARS) : null;
+  const denials = Array.isArray(value.permission_denials) ? value.permission_denials : [];
+  const errors = Array.isArray(value.errors) ? value.errors : [];
+  return {
+    subtype: stringField(value, "subtype"),
+    is_error: value.is_error === true,
+    result,
+    num_turns: intField(value, "num_turns"),
+    total_cost_usd: typeof value.total_cost_usd === "number" && Number.isFinite(value.total_cost_usd) ? value.total_cost_usd : null,
+    usage: isRecord(value.usage)
+      ? {
+          input_tokens: intField(value.usage, "input_tokens"),
+          output_tokens: intField(value.usage, "output_tokens"),
+          cache_creation_input_tokens: intField(value.usage, "cache_creation_input_tokens"),
+          cache_read_input_tokens: intField(value.usage, "cache_read_input_tokens"),
+        }
+      : null,
+    permission_denials: denials
+      .map((denial) => (isRecord(denial) ? stringField(denial, "tool_name") : null))
+      .filter((name): name is string => name !== null)
+      .slice(0, 100),
+    errors: errors.filter((error): error is string => typeof error === "string").map((error) => error.slice(0, 2_000)).slice(0, 20),
+  };
+}
+
+function intField(obj: Record<string, unknown>, key: string): number | null {
+  const v = obj[key];
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
+}
+
+export interface GitStatusEntry {
+  /** Two-letter porcelain status, such as ` M`, `A `, or `??`. */
+  status: string;
+  path: string;
+  /** Previous path of a rename or copy. */
+  from: string | null;
+}
+
+/** Parse `git status --porcelain=v1 -z`. Malformed entries are skipped. */
+export function parseGitStatusZ(text: string): GitStatusEntry[] {
+  const fields = text.split("\0");
+  const entries: GitStatusEntry[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i];
+    if (field === undefined || field.length < 4 || field[2] !== " ") continue;
+    const status = field.slice(0, 2);
+    const path = field.slice(3);
+    let from: string | null = null;
+    if (status.includes("R") || status.includes("C")) {
+      from = fields[i + 1] ?? null;
+      i++;
+    }
+    entries.push({ status, path, from });
+  }
+  return entries;
+}

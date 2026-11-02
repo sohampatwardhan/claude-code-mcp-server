@@ -6,7 +6,8 @@
  * Create and follow-up start with `--cloud=`. `teleportArgv` is the one
  * exception: print-mode `--teleport=<session>` is how the CLI checks out the
  * branch a cloud session pushed. It carries no prompt and is not a `--cloud=`
- * argv. `assertCloud` still guards create and follow-up.
+ * argv. `assertCloud` still guards create and follow-up. `localRunArgv` is the
+ * only local Claude Code run: print mode, guarded by `assertLocal`.
  */
 
 const TELEPORT_SESSION = /^(?:session|cse)_[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -55,6 +56,106 @@ export function teleportArgv(sessionId: string, debugFile: string): string[] {
     !debugFileArg.startsWith("--debug-file=")
   ) {
     throw new Error("internal error: teleport argv drifted");
+  }
+  return argv;
+}
+
+/** Local Claude Code session ids are UUIDs. */
+export const LOCAL_SESSION_ID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/** A model alias (`opus`, `sonnet[1m]`) or full model name (`claude-opus-5-5`). */
+export const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:\[[0-9a-z]{1,10}\])?$/;
+
+/**
+ * Permission modes a local run may use. `bypassPermissions` (the same as
+ * `--dangerously-skip-permissions`) is never offered. `dontAsk` denies any
+ * call that would prompt, which is what an unattended print-mode run needs.
+ */
+export const LOCAL_PERMISSION_MODES = ["dontAsk", "acceptEdits", "plan", "auto"] as const;
+export type LocalPermissionMode = (typeof LOCAL_PERMISSION_MODES)[number];
+
+/** Built-in tools a local run may pre-approve with `--allowedTools`. No patterns, no MCP tools. */
+export const LOCAL_ALLOWED_TOOLS = [
+  "Read",
+  "Glob",
+  "Grep",
+  "Edit",
+  "Write",
+  "NotebookEdit",
+  "Bash",
+  "WebFetch",
+  "WebSearch",
+] as const;
+export type LocalAllowedTool = (typeof LOCAL_ALLOWED_TOOLS)[number];
+
+export interface LocalRunOptions {
+  prompt: string;
+  permissionMode: LocalPermissionMode;
+  model: string | null;
+  maxTurns: number | null;
+  allowedTools: readonly LocalAllowedTool[];
+  resume: string | null;
+  /**
+   * Run in Claude Code's restricted mode with no MCP servers: no tools that
+   * run commands or code, no WebFetch, no user or project settings files
+   * (so no checkout hooks, allow rules or `.mcp.json`), file tools confined
+   * to the working directory, and writes to settings and git files refused.
+   * Set whenever the operator has not allowed shell access.
+   */
+  restricted: boolean;
+}
+
+/**
+ * Print-mode `claude -p` for `claude_run_local`, the one tool that runs
+ * Claude Code locally. The permission mode is always explicit, so a settings
+ * file's `defaultMode` can't turn a run into `bypassPermissions`.
+ */
+export function localRunArgv(options: LocalRunOptions): string[] {
+  const { prompt, permissionMode, model, maxTurns, allowedTools, resume, restricted } = options;
+  if (!(LOCAL_PERMISSION_MODES as readonly string[]).includes(permissionMode)) {
+    throw new Error("internal error: local permission mode is not allowed");
+  }
+  if (model !== null && !MODEL_PATTERN.test(model)) throw new Error("internal error: model does not match its pattern");
+  if (maxTurns !== null && (!Number.isSafeInteger(maxTurns) || maxTurns < 1)) {
+    throw new Error("internal error: max turns must be a positive integer");
+  }
+  if (allowedTools.some((tool) => !(LOCAL_ALLOWED_TOOLS as readonly string[]).includes(tool))) {
+    throw new Error("internal error: allowed tool is not on the fixed list");
+  }
+  if (resume !== null && !LOCAL_SESSION_ID_PATTERN.test(resume)) {
+    throw new Error("internal error: resume is not a session id");
+  }
+  const argv = ["-p"];
+  if (restricted) argv.push("--restricted", "--strict-mcp-config");
+  argv.push("--output-format=stream-json", "--verbose", `--permission-mode=${permissionMode}`);
+  if (model !== null) argv.push(`--model=${model}`);
+  if (maxTurns !== null) argv.push(`--max-turns=${maxTurns}`);
+  if (allowedTools.length > 0) argv.push(`--allowedTools=${[...new Set(allowedTools)].join(",")}`);
+  if (resume !== null) argv.push(`--resume=${resume}`);
+  argv.push("--", prompt);
+  return assertLocal(argv);
+}
+
+/**
+ * Invariant: a local run is print mode and never a cloud, teleport, or
+ * permission-skipping invocation. Everything before `--` is a flag this
+ * module built.
+ */
+function assertLocal(argv: string[]): string[] {
+  const end = argv.indexOf("--");
+  const flags = end === -1 ? argv : argv.slice(0, end);
+  if (
+    argv[0] !== "-p" ||
+    end !== argv.length - 2 ||
+    flags.some(
+      (arg) =>
+        arg.startsWith("--cloud") ||
+        arg.startsWith("--teleport") ||
+        arg.startsWith("--dangerously") ||
+        arg.includes("bypassPermissions"),
+    )
+  ) {
+    throw new Error("internal error: local argv must be print mode with no --cloud, --teleport, or permission bypass");
   }
   return argv;
 }

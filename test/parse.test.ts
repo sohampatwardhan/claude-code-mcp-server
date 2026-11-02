@@ -3,12 +3,14 @@ import { describe, it } from "node:test";
 
 import {
   AuthParseError,
+  LocalStreamParser,
   SESSION_REF_PATTERN,
   findSessionId,
   findSessionUrl,
   parseAuthStatus,
   parseCreateOutput,
   parseFollowupOutput,
+  parseGitStatusZ,
   parseTeleportOutput,
   stripAnsi,
 } from "../src/parse.js";
@@ -276,5 +278,115 @@ describe("parseTeleportOutput", () => {
 describe("stripAnsi", () => {
   it("removes SGR and OSC sequences", () => {
     assert.equal(stripAnsi("\u001b[31mred\u001b[0m \u001b]8;;https://x\u0007link\u001b]8;;\u0007"), "red link");
+  });
+});
+
+describe("LocalStreamParser", () => {
+  const SESSION = "1f0e2c9a-6d0b-4c11-9f39-2a77c1d4e8b5";
+  const lines = [
+    { type: "system", subtype: "init", session_id: SESSION, cwd: "/repo", tools: ["Read"] },
+    { type: "assistant", session_id: SESSION, message: { role: "assistant", content: [{ type: "text", text: "hi" }] } },
+    { type: "user", session_id: SESSION, message: { role: "user", content: [] } },
+    { type: "assistant", session_id: SESSION, message: { role: "assistant", content: [] } },
+    {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      duration_ms: 5120,
+      num_turns: 3,
+      result: "Fixed the failing test.",
+      session_id: SESSION,
+      total_cost_usd: 0.0421,
+      usage: { input_tokens: 10, output_tokens: 250, cache_creation_input_tokens: 900, cache_read_input_tokens: 1200, server_tool_use: {} },
+      modelUsage: {},
+      permission_denials: [{ tool_name: "Bash", tool_use_id: "toolu_1", tool_input: { command: "rm -rf /" } }, { bogus: true }],
+    },
+  ].map((line) => JSON.stringify(line) + "\n");
+
+  it("reads the session, assistant count and result line, whatever the chunk boundaries", () => {
+    const whole = lines.join("");
+    for (const size of [1, 7, 64, whole.length]) {
+      const parser = new LocalStreamParser();
+      for (let i = 0; i < whole.length; i += size) parser.push(whole.slice(i, i + size));
+      parser.end();
+      assert.equal(parser.sessionId, SESSION, `chunk size ${size}`);
+      assert.equal(parser.assistantMessages, 2);
+      assert.deepEqual(parser.result, {
+        subtype: "success",
+        is_error: false,
+        result: "Fixed the failing test.",
+        num_turns: 3,
+        total_cost_usd: 0.0421,
+        usage: { input_tokens: 10, output_tokens: 250, cache_creation_input_tokens: 900, cache_read_input_tokens: 1200 },
+        permission_denials: ["Bash"],
+        errors: [],
+      });
+    }
+  });
+
+  it("reads an error result and a final line with no newline", () => {
+    const parser = new LocalStreamParser();
+    parser.push(lines[0] ?? "");
+    parser.push(
+      JSON.stringify({
+        type: "result",
+        subtype: "error_max_turns",
+        is_error: true,
+        num_turns: 3,
+        session_id: SESSION,
+        total_cost_usd: 0.01,
+        usage: {},
+        permission_denials: [],
+        errors: ["Reached maximum number of turns (3)", 42],
+      }),
+    );
+    const pending = parser.result;
+    assert.equal(pending, null, "no result until the last line ends");
+    parser.end();
+    assert.equal(parser.result?.subtype, "error_max_turns");
+    assert.equal(parser.result?.is_error, true);
+    assert.equal(parser.result?.result, null);
+    assert.deepEqual(parser.result?.errors, ["Reached maximum number of turns (3)"]);
+    assert.deepEqual(parser.result?.usage, {
+      input_tokens: null,
+      output_tokens: null,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: null,
+    });
+  });
+
+  it("ignores non-JSON lines, non-UUID session ids, and leaves everything null without a result", () => {
+    const parser = new LocalStreamParser();
+    parser.push("warning: something\n{not json}\n[1,2]\n");
+    parser.push(JSON.stringify({ type: "system", subtype: "init", session_id: "session_01ABCDEFGH" }) + "\n");
+    parser.end();
+    assert.equal(parser.sessionId, null);
+    assert.equal(parser.result, null);
+    assert.equal(parser.assistantMessages, 0);
+  });
+
+  it("takes the session id from the result line when resume forked a new session", () => {
+    const forked = "22222222-3333-4444-8555-666666666666";
+    const parser = new LocalStreamParser();
+    parser.push(lines[0] ?? "");
+    parser.push(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "ok", session_id: forked }) + "\n");
+    assert.equal(parser.sessionId, forked);
+  });
+});
+
+describe("parseGitStatusZ", () => {
+  it("reads modified, added, untracked, and renamed entries, including spaces in paths", () => {
+    const text = [" M src/a.ts", "A  new file.txt", "?? notes/todo.md", "R  b.ts", "old b.ts", ""].join("\0");
+    assert.deepEqual(parseGitStatusZ(text), [
+      { status: " M", path: "src/a.ts", from: null },
+      { status: "A ", path: "new file.txt", from: null },
+      { status: "??", path: "notes/todo.md", from: null },
+      { status: "R ", path: "b.ts", from: "old b.ts" },
+    ]);
+  });
+
+  it("returns no entries for a clean tree and skips malformed fields", () => {
+    assert.deepEqual(parseGitStatusZ(""), []);
+    assert.deepEqual(parseGitStatusZ("XY\0garbage\0"), []);
   });
 });
