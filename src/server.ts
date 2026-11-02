@@ -41,6 +41,18 @@ import { claudeJsonPath, ensureWorkspaceTrusted, isTrustPrompt, resolveTrustProj
 export const SERVER_NAME = "claude-code-mcp-server";
 export const SERVER_VERSION = "0.1.0";
 
+/** Server-level guidance sent to clients in the initialize result. */
+export const SERVER_INSTRUCTIONS =
+  "Starts and drives Claude Code cloud sessions. Check results with claude_get_session, which reports the " +
+  "branch a session pushed and any pull request it opened; the conversation and replies are only visible at " +
+  "the session's session_url.\n\n" +
+  "If a cloud session can't push its branch to GitHub (claude_get_session finds no branch, or the session " +
+  "says the push failed), don't wait for it to retry. Use claude_send_followup to ask it to print its changes " +
+  "as a patch: preferably `git format-patch origin/<base>..HEAD --stdout` against the base branch, otherwise " +
+  "a full unified `git diff` that includes new files. Copy the patch from the session_url, apply it to your " +
+  "own checkout (`git am`, or `git apply --3way`), run the tests, then commit, push and open or update the " +
+  "pull request yourself.";
+
 /** Below Linux's per-argument limit (MAX_ARG_STRLEN, 128 KiB). */
 const MAX_TEXT_LENGTH = 100_000;
 
@@ -208,7 +220,7 @@ const authOutput = z
 // ---- server --------------------------------------------------------------
 
 export function createServer(config: Config, runner: Runner = runCli): McpServer {
-  const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
+  const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: SERVER_INSTRUCTIONS });
 
   /** Runs the CLI; returns the result on exit 0, otherwise a tool error. */
   async function run(args: string[]): Promise<RunResult | CallToolResult> {
@@ -284,7 +296,9 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
         "`base_branch` is set, checked out there before the CLI runs. Any other absolute directory must be " +
         "on CLAUDE_MCP_REPOS. Omit `repo` to use CLAUDE_MCP_CWD. When Claude Code asks to trust the chosen " +
         "folder, the call fails with WORKSPACE_NOT_TRUSTED unless CLAUDE_MCP_TRUST_CWD=1. The cloud VM's " +
-        "clone, push, and pull request use the Claude GitHub app (or /web-setup), not this server.",
+        "clone, push, and pull request use the Claude GitHub app (or /web-setup), not this server. " +
+        "If the session later can't push its branch to GitHub, ask it via claude_send_followup for a " +
+        "`git format-patch` (or full `git diff`) of its changes and apply, test, push and open the PR yourself.",
       inputSchema: createInput,
       outputSchema: createOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -377,7 +391,10 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       title: "Send follow-up to Claude Code cloud session",
       description:
         "Queue a follow-up message into an existing Claude Code cloud session via " +
-        "`claude --cloud <session> -p <message>`.",
+        "`claude --cloud <session> -p <message>`. Replies are only visible at the session_url; claude_get_session " +
+        "reports the pushed branch and pull request. If the session " +
+        "can't push to GitHub, use this to ask for `git format-patch origin/<base>..HEAD --stdout` (or a full " +
+        "`git diff` including new files), then apply it locally with `git am` / `git apply --3way` and push it yourself.",
       inputSchema: followupInput,
       outputSchema: followupOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },

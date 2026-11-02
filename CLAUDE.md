@@ -17,6 +17,7 @@ MCP server (TypeScript, Node 20+, `@modelcontextprotocol/sdk`, stdio) that wraps
 - Argv is built only in `src/argv.ts`, in a fixed order, and passed as an array to `spawn` with `shell: false`. Attach values as `--flag=value`, or place them after `--`, so they can't be read as flags.
 - Every tool declares an `outputSchema` and returns `structuredContent`. Errors use the `{ error: { code, message, args, cli } }` shape with a code from `ErrorCode` in `src/server.ts`.
 - Output parsing lives in `src/parse.ts` and never throws on unrecognised create/follow-up output. It returns `parsed: false` plus the raw output instead. When you change a regex, add test cases built from real CLI output.
+- **Push-failure fallback.** If a cloud session can't push to GitHub (`claude_get_session` finds no branch), the calling agent asks it (via `claude_send_followup`) for `git format-patch origin/<base>..HEAD --stdout` or a full `git diff`, copies the patch from the `session_url`, applies it locally (`git am` / `git apply --3way`), runs the tests and pushes/opens the PR itself. Keep this guidance in `SERVER_INSTRUCTIONS`, the create/follow-up tool descriptions and the README in sync.
 - Keep dependencies minimal (the SDK and zod at runtime; TypeScript and `@types/node` for dev). No telemetry. The server makes no network calls of its own except `git clone` / `git fetch` for a validated github.com `owner/name` into the cache, and `gh pr list` when session status needs a pull request.
 
 ## Library docs

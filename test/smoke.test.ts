@@ -161,6 +161,12 @@ describe("stdio smoke test", () => {
       assert.deepEqual(byName.claude_get_session?.inputSchema.required, ["session"]);
       assert.deepEqual(byName.claude_send_followup?.inputSchema.required?.slice().sort(), ["message", "session"]);
       assert.deepEqual(byName.claude_auth_status?.inputSchema.properties, {});
+      assert.match(client.getInstructions() ?? "", /can't push its branch to GitHub/);
+      assert.match(client.getInstructions() ?? "", /git format-patch/);
+      assert.match(client.getInstructions() ?? "", /claude_get_session/);
+      assert.doesNotMatch(client.getInstructions() ?? "", /no status tool/);
+      assert.match(byName.claude_create_cloud_session?.description ?? "", /git format-patch/);
+      assert.match(byName.claude_send_followup?.description ?? "", /git format-patch/);
     } finally {
       await close();
     }
