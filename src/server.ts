@@ -40,7 +40,7 @@ import {
 import { claudeJsonPath, ensureWorkspaceTrusted, isTrustPrompt, resolveTrustProjectPath } from "./trust.js";
 
 export const SERVER_NAME = "claude-code-mcp-server";
-export const SERVER_VERSION = "0.1.0";
+export const SERVER_VERSION = "0.1.1";
 
 /** Server-level guidance sent to clients in the initialize result. */
 export const SERVER_INSTRUCTIONS =

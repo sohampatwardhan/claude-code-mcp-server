@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import { CLI_INSTALL_COMMAND, cliNotFoundMessage, findCli, isSignInError, signInMessage } from "../src/prereq.js";
 
-const tmp = mkdtempSync(join(tmpdir(), "claude-mcp-prereq-"));
+// realpath: on macOS tmpdir() is under /var, a symlink to /private/var, and git and
+// process.cwd() report the /private/var form.
+const tmp = realpathSync(mkdtempSync(join(tmpdir(), "claude-mcp-prereq-")));
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
 describe("CLI prerequisites", () => {

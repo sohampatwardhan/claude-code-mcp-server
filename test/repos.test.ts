@@ -16,7 +16,9 @@ import {
   syncCachedCheckout,
 } from "../src/repos.js";
 
-const tmp = mkdtempSync(join(tmpdir(), "claude-mcp-repos-"));
+// realpath: on macOS tmpdir() is under /var, a symlink to /private/var, and git and
+// process.cwd() report the /private/var form.
+const tmp = realpathSync(mkdtempSync(join(tmpdir(), "claude-mcp-repos-")));
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
 function git(args: string[], cwd?: string): void {

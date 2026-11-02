@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import { TrustFileError, ensureWorkspaceTrusted, isTrustPrompt, resolveTrustProjectPath } from "../src/trust.js";
 
-const tmp = mkdtempSync(join(tmpdir(), "claude-mcp-trust-"));
+// realpath: on macOS tmpdir() is under /var, a symlink to /private/var, and git and
+// process.cwd() report the /private/var form.
+const tmp = realpathSync(mkdtempSync(join(tmpdir(), "claude-mcp-trust-")));
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
 describe("isTrustPrompt", () => {
@@ -134,5 +136,13 @@ describe("resolveTrustProjectPath", () => {
     const dir = join(tmp, "plain");
     mkdirSync(dir);
     assert.equal(await resolveTrustProjectPath(dir), dir);
+  });
+
+  it("resolves symlinks outside a git checkout, matching the CLI's process.cwd()", async () => {
+    const dir = join(tmp, "plain-target");
+    const link = join(tmp, "plain-link");
+    mkdirSync(dir);
+    symlinkSync(dir, link, "dir");
+    assert.equal(await resolveTrustProjectPath(link), dir);
   });
 });

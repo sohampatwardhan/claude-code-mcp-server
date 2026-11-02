@@ -7,7 +7,9 @@ import { after, describe, it } from "node:test";
 import { authStatusArgv, createSessionArgv, sendFollowupArgv, teleportArgv } from "../src/argv.js";
 import { ConfigError, DEFAULT_TIMEOUT_MS, loadConfig } from "../src/config.js";
 
-const tmp = mkdtempSync(join(tmpdir(), "claude-mcp-config-"));
+// realpath: on macOS tmpdir() is under /var, a symlink to /private/var, and git and
+// process.cwd() report the /private/var form.
+const tmp = realpathSync(mkdtempSync(join(tmpdir(), "claude-mcp-config-")));
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
 describe("argv construction", () => {

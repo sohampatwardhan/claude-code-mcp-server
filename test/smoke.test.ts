@@ -19,7 +19,9 @@ const fakeGh = join(root, "test/fixtures/fake-gh.mjs");
 chmodSync(fakeClaude, 0o755);
 chmodSync(fakeGh, 0o755);
 
-const tmp = mkdtempSync(join(tmpdir(), "claude-mcp-smoke-"));
+// realpath: on macOS tmpdir() is under /var, a symlink to /private/var, and git and
+// process.cwd() report the /private/var form.
+const tmp = realpathSync(mkdtempSync(join(tmpdir(), "claude-mcp-smoke-")));
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
 let logCounter = 0;
@@ -133,7 +135,7 @@ function expectedTrustPath(dir: string = process.cwd()): string {
     }).trim();
     return toplevel || dir;
   } catch {
-    return dir;
+    return realpathSync(dir);
   }
 }
 
