@@ -3,7 +3,7 @@
 // CLI's cloud output and never touches the network.
 //
 //   FAKE_CLAUDE_ARGV_LOG   if set, the received argv is appended here as a JSON line
-//   FAKE_CLAUDE_META_LOG   if set, { args, cwd, stdoutIsTTY, stdinIsTTY } is appended
+//   FAKE_CLAUDE_META_LOG   if set, { args, cwd, pid, stdoutIsTTY, stdinIsTTY } is appended
 //   FAKE_CLAUDE_STDIN_LOG  if set, bytes read while the trust dialog is up are appended
 //   FAKE_CLAUDE_MODE       "fail" -> exit 1 with stderr; "hang" -> never exit;
 //                          "garbled" -> exit 0 with unparseable output;
@@ -43,6 +43,7 @@ if (process.env.FAKE_CLAUDE_META_LOG) {
     JSON.stringify({
       args,
       cwd: process.cwd(),
+      pid: process.pid,
       stdoutIsTTY: process.stdout.isTTY === true,
       stdinIsTTY: process.stdin.isTTY === true,
     }) + "\n",

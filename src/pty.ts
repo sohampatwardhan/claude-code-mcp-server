@@ -4,12 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
+import { KILL_GRACE_MS, killGroup, track } from "./children.js";
 import { RunError, type RunResult } from "./runner.js";
 
 /** Per-stream cap on captured output, to bound memory. Mirrors runner.ts. */
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
-/** Grace period between SIGTERM and SIGKILL after a timeout or trust refusal. */
-const KILL_GRACE_MS = 5_000;
 /**
  * Delay before answering the trust dialog. Claude Code switches the pty into
  * raw mode as it draws the prompt and may flush input queued before that;
@@ -23,6 +22,8 @@ export interface PtyRunResult extends RunResult {
    * not to answer it. `accepted` when it was shown and an Enter key was sent.
    */
   trustPrompt: "absent" | "accepted" | "refused";
+  /** True when the run was stopped because it printed nothing for `idleTimeoutMs`. */
+  idleTimedOut: boolean;
 }
 
 export type PtyTrustDecision = "accept" | "refuse" | "wait";
@@ -36,6 +37,8 @@ export interface PtyRunOptions {
   onOutput?: (output: string) => PtyTrustDecision;
   /** Called with each decoded chunk of raw output, including after the trust dialog is answered. */
   onProgress?: (chunk: string) => void;
+  /** Stop the run when it prints nothing for this long. Null or omitted turns this off. */
+  idleTimeoutMs?: number | null;
 }
 
 /**
@@ -44,8 +47,10 @@ export interface PtyRunOptions {
  * Claude Code's dialog, and because the helper can record the child pid for
  * a reliable timeout. The helper execs `bin` with `args` directly (no shell).
  * Stdout and stderr share the terminal, so both are returned in `stdout`.
+ * If the server dies and the helper is re-parented, it stops the CLI's
+ * process group (SIGTERM, then SIGKILL 5 s later) so no orphan is left.
  */
-const PTY_HELPER_PY = String.raw`import errno, fcntl, json, os, pty, select, signal, struct, sys, termios
+const PTY_HELPER_PY = String.raw`import errno, fcntl, json, os, pty, select, signal, struct, sys, termios, time
 
 def write_all(fd, data):
     view = memoryview(data)
@@ -73,6 +78,7 @@ def main():
         sys.stderr.write("pty helper: invalid spec\n")
         os._exit(2)
 
+    parent = os.getppid()
     pid, master = pty.fork()
     if pid == 0:
         try:
@@ -100,14 +106,17 @@ def main():
     except OSError:
         pass
 
-    def stop_child(_signum, _frame):
+    def signal_child(sig):
         try:
-            os.killpg(pid, signal.SIGTERM)
+            os.killpg(pid, sig)
         except OSError:
             try:
-                os.kill(pid, signal.SIGTERM)
+                os.kill(pid, sig)
             except OSError:
                 pass
+
+    def stop_child(_signum, _frame):
+        signal_child(signal.SIGTERM)
 
     signal.signal(signal.SIGTERM, stop_child)
     signal.signal(signal.SIGINT, stop_child)
@@ -118,6 +127,7 @@ def main():
     stdin_open = True
     child_done = False
     status = 1
+    orphaned_at = None
     os.set_blocking(master, False)
     try:
         os.set_blocking(stdin_fd, False)
@@ -148,6 +158,11 @@ def main():
         if wpid == pid:
             child_done = True
             break
+        if orphaned_at is None and os.getppid() != parent:
+            orphaned_at = time.monotonic()
+            signal_child(signal.SIGTERM)
+        elif orphaned_at is not None and time.monotonic() - orphaned_at > 5:
+            signal_child(signal.SIGKILL)
         watch = [master]
         if stdin_open:
             watch.append(stdin_fd)
@@ -221,6 +236,7 @@ export function runCliPty(bin: string, args: string[], timeoutMs: number, option
       stdio: ["pipe", "pipe", "pipe"],
       env,
       windowsHide: true,
+      detached: true,
     });
     child.stdin.on("error", () => {
       // The helper may exit before a trust keystroke is written.
@@ -231,23 +247,34 @@ export function runCliPty(bin: string, args: string[], timeoutMs: number, option
     let trustPrompt: PtyRunResult["trustPrompt"] = "absent";
     let acceptTimer: NodeJS.Timeout | undefined;
     let timedOut = false;
+    let idleTimedOut = false;
+    let idleTimer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
     let settled = false;
 
     const killTree = (signal: NodeJS.Signals) => {
       killRecordedChild(pidPath, signal);
-      try {
-        child.kill(signal);
-      } catch {
-        // already exited
-      }
+      killGroup(child, signal);
     };
+    track(child, killTree);
 
     const armKill = () => {
       killTree("SIGTERM");
+      if (killTimer) return;
       killTimer = setTimeout(() => killTree("SIGKILL"), KILL_GRACE_MS);
       killTimer.unref();
     };
+
+    const idleMs = options.idleTimeoutMs ?? null;
+    const armIdle = () => {
+      if (idleMs === null || settled || idleTimedOut) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleTimedOut = true;
+        armKill();
+      }, idleMs);
+    };
+    armIdle();
 
     const consider = () => {
       if (trustPrompt !== "absent" || settled) return;
@@ -272,6 +299,7 @@ export function runCliPty(bin: string, args: string[], timeoutMs: number, option
     const progress = new StringDecoder("utf8");
     child.stdout.on("data", (chunk: Buffer) => {
       stdout.push(chunk);
+      armIdle();
       options.onProgress?.(progress.write(chunk));
       consider();
     });
@@ -286,6 +314,7 @@ export function runCliPty(bin: string, args: string[], timeoutMs: number, option
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (acceptTimer) clearTimeout(acceptTimer);
       if (killTimer) clearTimeout(killTimer);
       rmSync(dir, { recursive: true, force: true });
@@ -296,6 +325,7 @@ export function runCliPty(bin: string, args: string[], timeoutMs: number, option
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (acceptTimer) clearTimeout(acceptTimer);
       if (killTimer) clearTimeout(killTimer);
       rmSync(dir, { recursive: true, force: true });
@@ -320,6 +350,7 @@ export function runCliPty(bin: string, args: string[], timeoutMs: number, option
         timedOut,
         durationMs: Date.now() - started,
         trustPrompt,
+        idleTimedOut,
       });
     });
   });

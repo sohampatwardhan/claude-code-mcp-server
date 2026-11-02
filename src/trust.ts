@@ -4,6 +4,7 @@ import { existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSyn
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
+import { killGroup, track } from "./children.js";
 import { cleanTerminalText } from "./parse.js";
 
 /** Claude Code stores per-folder workspace trust here, not under `~/.claude/`. */
@@ -190,9 +191,10 @@ function git(cwd: string, args: string[]): Promise<string | null> {
   return new Promise((resolvePromise) => {
     let out = "";
     let settled = false;
-    const child = spawn("git", ["-C", cwd, ...args], { shell: false, stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn("git", ["-C", cwd, ...args], { shell: false, stdio: ["ignore", "pipe", "ignore"], detached: true });
+    track(child);
     const timer = setTimeout(() => {
-      child.kill("SIGTERM");
+      killGroup(child, "SIGTERM");
     }, 5_000);
     timer.unref();
     const finish = (value: string | null) => {

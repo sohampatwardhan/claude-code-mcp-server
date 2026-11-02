@@ -1,11 +1,10 @@
 import { spawn } from "node:child_process";
 
+import { KILL_GRACE_MS, killGroup, track } from "./children.js";
 import { cliNotFoundMessage } from "./prereq.js";
 
 /** Per-stream cap on captured output, to bound memory. */
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
-/** Grace period between SIGTERM and SIGKILL after a timeout. */
-const KILL_GRACE_MS = 5_000;
 
 export interface RunResult {
   exitCode: number | null;
@@ -32,7 +31,8 @@ export type Runner = (bin: string, args: string[], timeoutMs: number, cwd: strin
 
 /**
  * Spawns `bin` with an argv array (never a shell), stdin closed, and a hard
- * timeout. `cwd` is the directory the CLI runs in. Resolves with the outcome
+ * timeout. The child leads its own process group and is tracked so a cancel
+ * or shutdown can stop it. `cwd` is the directory the CLI runs in. Resolves with the outcome
  * for any process that started; rejects with RunError only when the process
  * could not be started.
  */
@@ -45,7 +45,9 @@ export const runCli: Runner = (bin, args, timeoutMs, cwd) =>
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, NO_COLOR: "1" },
       windowsHide: true,
+      detached: true,
     });
+    track(child);
 
     const stdout = collector();
     const stderr = collector();
@@ -56,8 +58,8 @@ export const runCli: Runner = (bin, args, timeoutMs, cwd) =>
     let killTimer: NodeJS.Timeout | undefined;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
+      killGroup(child, "SIGTERM");
+      killTimer = setTimeout(() => killGroup(child, "SIGKILL"), KILL_GRACE_MS);
       killTimer.unref();
     }, timeoutMs);
 

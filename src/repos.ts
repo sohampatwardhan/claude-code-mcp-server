@@ -15,6 +15,8 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 
+import { KILL_GRACE_MS, currentScope, killGroup, track } from "./children.js";
+
 /** One path segment of a GitHub owner or repository name. */
 export const GITHUB_SLUG_PART = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -622,7 +624,9 @@ function runCommand(
       env: { ...process.env, ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      detached: true,
     });
+    track(child);
     const cap = (buf: { text: string }, chunk: Buffer) => {
       if (buf.text.length < 8_000) buf.text += chunk.toString("utf8");
     };
@@ -631,8 +635,8 @@ function runCommand(
     let killTimer: NodeJS.Timeout | undefined;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      killGroup(child, "SIGTERM");
+      killTimer = setTimeout(() => killGroup(child, "SIGKILL"), KILL_GRACE_MS);
       killTimer.unref();
     }, timeoutMs);
     const finish = (result: CmdResult) => {
@@ -686,6 +690,7 @@ async function withLock<T>(lockPath: string, staleMs: number, fn: () => Promise<
 async function acquireLock(lockPath: string, staleMs: number): Promise<void> {
   const attempts = Math.max(1, Math.ceil(staleMs / LOCK_WAIT_MS));
   for (let attempt = 0; attempt < attempts; attempt++) {
+    if (currentScope()?.aborted === true) throw new RepoPrepareError(`cancelled while waiting for ${lockPath}`);
     try {
       const handle = await open(lockPath, "wx", 0o600);
       await handle.close();

@@ -55,6 +55,7 @@ describe("loadConfig", () => {
       claudeBin: "claude",
       defaultEnvironmentId: null,
       timeoutMs: DEFAULT_TIMEOUT_MS,
+      idleTimeoutMs: null,
       trustCwd: false,
       pythonBin: "python3",
       cwd: process.cwd(),
@@ -69,6 +70,7 @@ describe("loadConfig", () => {
         CLAUDE_BIN: "/opt/claude",
         CLAUDE_CLOUD_ENVIRONMENT_ID: "ccpool_x1",
         CLAUDE_MCP_TIMEOUT_MS: "1500",
+        CLAUDE_MCP_IDLE_TIMEOUT_MS: "90000",
         CLAUDE_MCP_TRUST_CWD: "yes",
         CLAUDE_MCP_PYTHON: "/usr/bin/python3",
         CLAUDE_MCP_CWD: tmp,
@@ -79,6 +81,7 @@ describe("loadConfig", () => {
         claudeBin: "/opt/claude",
         defaultEnvironmentId: "ccpool_x1",
         timeoutMs: 1500,
+        idleTimeoutMs: 90_000,
         trustCwd: true,
         pythonBin: "/usr/bin/python3",
         cwd: resolve(tmp),
@@ -111,6 +114,7 @@ describe("loadConfig", () => {
   it("rejects invalid timeout, environment, and trust-flag values", () => {
     for (const t of ["0", "-5", "1.5", "abc", "10s"]) {
       assert.throws(() => loadConfig({ CLAUDE_MCP_TIMEOUT_MS: t }), ConfigError, t);
+      assert.throws(() => loadConfig({ CLAUDE_MCP_IDLE_TIMEOUT_MS: t }), ConfigError, t);
     }
     assert.throws(() => loadConfig({ CLAUDE_CLOUD_ENVIRONMENT_ID: "--rm" }), ConfigError);
     assert.throws(() => loadConfig({ CLAUDE_CLOUD_ENVIRONMENT_ID: "a b" }), ConfigError);

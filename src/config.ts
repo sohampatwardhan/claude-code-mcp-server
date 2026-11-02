@@ -21,6 +21,8 @@ export interface Config {
   defaultEnvironmentId: string | null;
   /** Hard timeout for each spawned CLI process. */
   timeoutMs: number;
+  /** Default idle-output timeout for `claude --cloud` on create, or null when off. */
+  idleTimeoutMs: number | null;
   /**
    * When true, accept Claude Code's workspace-trust dialog for the process
    * working directory (the main git checkout when that directory is a
@@ -58,16 +60,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
-  const rawTimeout = (env.CLAUDE_MCP_TIMEOUT_MS ?? "").trim();
-  let timeoutMs = DEFAULT_TIMEOUT_MS;
-  if (rawTimeout !== "") {
-    if (!/^[1-9][0-9]*$/.test(rawTimeout)) {
-      throw new ConfigError(
-        `CLAUDE_MCP_TIMEOUT_MS must be a positive integer (milliseconds), got ${JSON.stringify(rawTimeout)}`,
-      );
-    }
-    timeoutMs = Number(rawTimeout);
-  }
+  const timeoutMs = parseMilliseconds("CLAUDE_MCP_TIMEOUT_MS", env.CLAUDE_MCP_TIMEOUT_MS) ?? DEFAULT_TIMEOUT_MS;
+  const idleTimeoutMs = parseMilliseconds("CLAUDE_MCP_IDLE_TIMEOUT_MS", env.CLAUDE_MCP_IDLE_TIMEOUT_MS);
 
   const trustCwd = parseBooleanFlag("CLAUDE_MCP_TRUST_CWD", env.CLAUDE_MCP_TRUST_CWD);
   const pythonBin = (env.CLAUDE_MCP_PYTHON ?? "").trim() || "python3";
@@ -84,6 +78,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     claudeBin,
     defaultEnvironmentId: rawEnvId === "" ? null : rawEnvId,
     timeoutMs,
+    idleTimeoutMs,
     trustCwd,
     pythonBin,
     cwd,
@@ -124,6 +119,16 @@ function resolveRepoCache(raw: string | undefined): string {
     throw new ConfigError(`CLAUDE_MCP_REPO_CACHE is not a directory: ${JSON.stringify(cache)}`);
   }
   return cache;
+}
+
+/** Unset or blank is null. A set value must be a positive integer number of milliseconds. */
+function parseMilliseconds(name: string, raw: string | undefined): number | null {
+  const value = (raw ?? "").trim();
+  if (value === "") return null;
+  if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw new ConfigError(`${name} must be a positive integer (milliseconds), got ${JSON.stringify(raw)}`);
+  }
+  return Number(value);
 }
 
 /** Empty means false. `1` / `true` / `yes` (any case) mean true. */

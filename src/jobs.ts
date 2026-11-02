@@ -20,8 +20,11 @@ export const JOB_TTL_MS = 60 * 60_000;
 /** At most this many finished jobs are kept; the oldest go first. */
 export const MAX_FINISHED_JOBS = 100;
 
-/** Phase a job reports. `done` is set only on success; a failed job reports its tool error instead. */
-export type JobStatus = "cloning" | "starting" | "running" | "done";
+/**
+ * Phase a job reports. `done` is set only on success; a failed job reports
+ * its tool error instead. `cancelled` is final and wins over a later result.
+ */
+export type JobStatus = "cloning" | "starting" | "running" | "done" | "cancelled";
 
 export interface Job<T> {
   readonly id: string;
@@ -64,7 +67,7 @@ export class JobStore<T> {
       .then(
         (result) => {
           job.result = result;
-          if (result.isError !== true) job.status = "done";
+          if (result.isError !== true && job.status !== "cancelled") job.status = "done";
         },
         (error: unknown) => {
           job.failure = { error };
@@ -80,6 +83,26 @@ export class JobStore<T> {
   get(id: string): Job<T> | null {
     this.prune();
     return this.jobs.get(id) ?? null;
+  }
+
+  /** Jobs that have not settled yet, oldest first. */
+  unfinished(): Job<T>[] {
+    return [...this.jobs.values()].filter((job) => job.finishedAt === null);
+  }
+
+  /** Move a running job to another phase. A cancelled or finished job keeps its phase. */
+  advance(job: Job<T>, status: JobStatus): void {
+    if (job.finishedAt === null && job.status !== "cancelled") job.status = status;
+  }
+
+  /**
+   * Mark a running job cancelled. Returns false when it already finished or
+   * was already cancelled. The caller stops the job's processes.
+   */
+  cancel(job: Job<T>): boolean {
+    if (job.finishedAt !== null || job.status === "cancelled") return false;
+    job.status = "cancelled";
+    return true;
   }
 
   elapsedMs(job: Job<T>): number {
