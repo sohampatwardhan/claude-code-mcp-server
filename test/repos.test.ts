@@ -183,7 +183,7 @@ describe("syncCachedCheckout", () => {
     git(["clone", "--bare", work, origin]);
     git(["remote", "add", "origin", origin], work);
 
-    assert.equal(await syncCachedCheckout(dest, origin, 20_000), "main");
+    assert.deepEqual(await syncCachedCheckout(dest, origin, 20_000), { branch: "main", cloned: true });
     assert.equal(readFileSync(join(dest, "README"), "utf8"), "one\n");
 
     writeFileSync(join(dest, "README"), "dirty\n");
@@ -191,9 +191,59 @@ describe("syncCachedCheckout", () => {
     writeFileSync(join(work, "README"), "two\n");
     git(["commit", "-am", "two"], work);
     git(["push", "origin", "main"], work);
-    await syncCachedCheckout(dest, origin, 20_000);
+    assert.deepEqual(await syncCachedCheckout(dest, origin, 20_000), { branch: "main", cloned: false });
     assert.equal(readFileSync(join(dest, "README"), "utf8"), "two\n");
     assert.throws(() => readFileSync(join(dest, "untracked.txt"), "utf8"));
+  });
+
+  it("makes a blob:none partial clone and reuses it with fetch instead of recloning", async () => {
+    const work = join(tmp, "partial-src");
+    const origin = join(tmp, "partial.git");
+    const dest = join(tmp, "partial-cache");
+    mkdirSync(work);
+    git(["init", "-b", "main", work]);
+    writeFileSync(join(work, "README"), "one\n");
+    git(["add", "README"], work);
+    git(["commit", "-m", "one"], work);
+    git(["clone", "--bare", work, origin]);
+    git(["config", "uploadpack.allowFilter", "true"], origin);
+    git(["remote", "add", "origin", origin], work);
+    // git ignores --filter for plain-path clones; file:// goes through the transport, like https.
+    const url = `file://${origin}`;
+    const config = (key: string) =>
+      execFileSync("git", ["config", "--get", key], { cwd: dest, encoding: "utf8" }).trim();
+
+    assert.deepEqual(await syncCachedCheckout(dest, url, 20_000), { branch: "main", cloned: true });
+    assert.equal(config("remote.origin.promisor"), "true");
+    assert.equal(config("remote.origin.partialclonefilter"), "blob:none");
+    assert.equal(readFileSync(join(dest, "README"), "utf8"), "one\n");
+
+    const marker = join(dest, ".git", "mcp-test-marker");
+    writeFileSync(marker, "kept\n");
+    writeFileSync(join(work, "README"), "two\n");
+    git(["commit", "-am", "two"], work);
+    git(["push", "origin", "main"], work);
+    assert.deepEqual(await syncCachedCheckout(dest, url, 20_000), { branch: "main", cloned: false });
+    assert.equal(readFileSync(marker, "utf8"), "kept\n");
+    assert.equal(readFileSync(join(dest, "README"), "utf8"), "two\n");
+    assert.equal(config("remote.origin.partialclonefilter"), "blob:none");
+  });
+
+  it("reclones a cache directory that is not a git checkout", async () => {
+    const work = join(tmp, "broken-src");
+    const origin = join(tmp, "broken.git");
+    const dest = join(tmp, "broken-cache");
+    mkdirSync(work);
+    git(["init", "-b", "main", work]);
+    writeFileSync(join(work, "README"), "fresh\n");
+    git(["add", "README"], work);
+    git(["commit", "-m", "fresh"], work);
+    git(["clone", "--bare", work, origin]);
+    mkdirSync(dest);
+    writeFileSync(join(dest, "leftover"), "x\n");
+    assert.deepEqual(await syncCachedCheckout(dest, origin, 20_000), { branch: "main", cloned: true });
+    assert.equal(readFileSync(join(dest, "README"), "utf8"), "fresh\n");
+    assert.throws(() => readFileSync(join(dest, "leftover"), "utf8"));
   });
 
   it("leaves a checkout with a different origin unchanged", async () => {

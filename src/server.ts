@@ -239,6 +239,19 @@ const createOutput = z
       .string()
       .nullable()
       .describe("Branch the GitHub cache checkout was on, or null when no GitHub repository was selected."),
+    cache: z
+      .object({
+        cloned: z
+          .boolean()
+          .describe("True when this job made a fresh partial clone; false when it reused the existing cache with git fetch."),
+        duration_ms: z
+          .number()
+          .int()
+          .describe("Time spent on the clone or fetch, checkout and clean, not counting a wait for another job's lock."),
+      })
+      .strict()
+      .nullable()
+      .describe("How the GitHub cache checkout was prepared. Null until it is ready, and for a local or default directory."),
     args: z.array(z.string()),
     cli: cliOutput.describe(
       "CLI output with terminal control sequences removed. Until status is done, exit_code is null and stdout holds the last 4,000 characters so far.",
@@ -277,13 +290,14 @@ const cancelOutput = z
 
 type CreateBody = z.infer<typeof createOutput>;
 
-/** Fixed fields of one create job. `cwd` and `baseBranch` are updated once the cache checkout is ready. */
+/** Fixed fields of one create job. `cwd`, `baseBranch` and `cache` are updated once the cache checkout is ready. */
 interface CreateJob {
   args: string[];
   environmentId: string | null;
   cwd: string;
   repo: string | null;
   baseBranch: string | null;
+  cache: CreateBody["cache"];
   /** Every process the job starts, so a cancel can stop them. */
   scope: Scope;
   timeoutMs: number;
@@ -433,6 +447,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
         cwd,
         repo: plan.kind === "github" ? plan.github.slug : plan.kind === "path" ? plan.repo : null,
         baseBranch: plan.kind === "github" ? plan.baseBranch : null,
+        cache: null,
         scope: new Scope(),
         timeoutMs: timeout_s === undefined ? config.timeoutMs : timeout_s * 1_000,
         idleTimeoutMs: idle_timeout_s === undefined ? config.idleTimeoutMs : idle_timeout_s * 1_000,
@@ -465,9 +480,10 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
           github.name,
           job.details.timeoutMs,
           plan.baseBranch,
-          (cwd, branch) => {
+          (cwd, checkout) => {
             job.details.cwd = cwd;
-            job.details.baseBranch = branch;
+            job.details.baseBranch = checkout.branch;
+            job.details.cache = { cloned: checkout.cloned, duration_ms: checkout.durationMs };
             return finishCreate(job, github);
           },
         );
@@ -522,7 +538,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
   }
 
   function createBody(job: Job<CreateJob>, status: JobStatus, parsed: ParsedCreate, output: CreateBody["cli"]): CreateBody {
-    const { args, environmentId, cwd, repo, baseBranch } = job.details;
+    const { args, environmentId, cwd, repo, baseBranch, cache } = job.details;
     return {
       job_id: job.id,
       status,
@@ -532,6 +548,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       cwd,
       repo,
       base_branch: baseBranch,
+      cache,
       args,
       cli: output,
     };
@@ -674,7 +691,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
         target.name,
         config.timeoutMs,
         baseBranch,
-        (cwd, checkedOut) => readSessionStatus(sessionId, target, cwd, checkedOut),
+        (cwd, checkout) => readSessionStatus(sessionId, target, cwd, checkout.branch),
       );
     } catch (err) {
       if (err instanceof RepoPrepareError) return toolError("REPO_PREPARE_FAILED", err.message, []);

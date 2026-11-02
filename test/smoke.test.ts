@@ -116,8 +116,10 @@ function githubRewrite(name: string, owner: string, repo: string): { env: Record
   writeFileSync(join(work, "README"), "develop\n");
   git(["commit", "-am", "develop"], work);
   git(["clone", "--bare", work, bare]);
+  // A file:// URL and allowFilter so the server's partial clone is honored, as it is on GitHub.
+  git(["config", "uploadpack.allowFilter", "true"], bare);
   const gitconfig = join(tmp, `${name}.gitconfig`);
-  writeFileSync(gitconfig, `[url "${bare}"]\n\tinsteadOf = https://github.com/${owner}/${repo}.git\n`);
+  writeFileSync(gitconfig, `[url "file://${bare}"]\n\tinsteadOf = https://github.com/${owner}/${repo}.git\n`);
   return { env: { GIT_CONFIG_GLOBAL: gitconfig, GIT_CONFIG_NOSYSTEM: "1" } };
 }
 
@@ -699,14 +701,24 @@ describe("stdio smoke test", () => {
         repo: string;
         base_branch: string;
         session_id: string;
+        cache: { cloned: boolean; duration_ms: number } | null;
       };
       assert.equal(createdBody.repo, "acme/widgets");
       assert.equal(createdBody.base_branch, "develop");
       assert.equal(createdBody.session_id, session);
+      assert.equal(createdBody.cache?.cloned, true);
+      assert.ok(Number.isInteger(createdBody.cache?.duration_ms) && createdBody.cache.duration_ms >= 0);
       assert.equal(readFileSync(join(createdBody.cwd, "README"), "utf8"), "develop\n");
       assert.equal(
         execFileSync("git", ["config", "--get", "remote.origin.url"], { cwd: createdBody.cwd, encoding: "utf8" }).trim(),
         "https://github.com/acme/widgets.git",
+      );
+      assert.equal(
+        execFileSync("git", ["config", "--get", "remote.origin.partialclonefilter"], {
+          cwd: createdBody.cwd,
+          encoding: "utf8",
+        }).trim(),
+        "blob:none",
       );
       assert.equal(metaCalls()[0]?.cwd, createdBody.cwd);
       assert.deepEqual(argvCalls()[0], ["--cloud=ship the widget"]);
@@ -751,6 +763,29 @@ describe("stdio smoke test", () => {
       assert.equal(
         execFileSync("git", ["symbolic-ref", "--short", "HEAD"], { cwd: createdBody.cwd, encoding: "utf8" }).trim(),
         "claude/session-branch",
+      );
+
+      // A second session on the same repository reuses the cache instead of recloning it.
+      const marker = join(createdBody.cwd, ".git", "mcp-test-marker");
+      writeFileSync(marker, "kept\n");
+      const again = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "second session", repo: "acme/widgets" },
+      })) as CallToolResult;
+      assert.notEqual(again.isError, true);
+      const againBody = again.structuredContent as {
+        cwd: string;
+        base_branch: string;
+        cache: { cloned: boolean; duration_ms: number } | null;
+      };
+      assert.equal(againBody.cwd, createdBody.cwd);
+      // The fixture's origin HEAD is develop, so that is the default branch.
+      assert.equal(againBody.base_branch, "develop");
+      assert.equal(againBody.cache?.cloned, false);
+      assert.equal(readFileSync(marker, "utf8"), "kept\n");
+      assert.equal(
+        execFileSync("git", ["symbolic-ref", "--short", "HEAD"], { cwd: againBody.cwd, encoding: "utf8" }).trim(),
+        "develop",
       );
     } finally {
       await close();
