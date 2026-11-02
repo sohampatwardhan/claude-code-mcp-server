@@ -338,6 +338,11 @@ const localOutput = z
     session_id: z.string().nullable().describe("Local session id. Pass it as `resume` to continue this session."),
     cwd: z.string().describe("Directory the CLI ran in, after resolving symlinks."),
     permission_mode: z.enum(LOCAL_PERMISSION_MODES),
+    restricted: z
+      .boolean()
+      .describe(
+        "True when the run used Claude Code's --restricted mode (CLAUDE_MCP_LOCAL_ALLOW_SHELL off): no shell or code tools, no WebFetch, no MCP servers, and the checkout's settings, hooks and .mcp.json not loaded.",
+      ),
     assistant_messages: z.number().int().describe("Assistant messages seen so far."),
     parsed: z.boolean().describe("True when the CLI's final result line was read."),
     subtype: z.string().nullable().describe("Result subtype, such as success or error_max_turns."),
@@ -422,6 +427,7 @@ interface LocalJob {
   args: string[];
   cwd: string;
   permissionMode: LocalBody["permission_mode"];
+  restricted: boolean;
   timeoutMs: number;
   scope: Scope;
   /** Reads the stream-json as it arrives; the transcript itself is not kept. */
@@ -995,8 +1001,9 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
         "Run Claude Code headless on this machine (`claude -p`) in an existing checkout, instead of a cloud " +
         "session: for work that needs the local toolchain or hardware. `cwd` must be inside a " +
         "CLAUDE_MCP_LOCAL_ROOTS directory after resolving symlinks; with no roots configured every call fails " +
-        "with LOCAL_RUNS_DISABLED. Print mode does not show the workspace-trust dialog, so the checkout's " +
-        "hooks, settings and allow rules apply. The run is a background job and this call returns within a few " +
+        "with LOCAL_RUNS_DISABLED. Unless CLAUDE_MCP_LOCAL_ALLOW_SHELL is set, the run uses Claude Code's " +
+        "--restricted mode: no shell or code tools, no WebFetch, no MCP servers, and the checkout's settings, " +
+        "hooks and .mcp.json are not loaded (needs Claude Code 2.1.248 or later). The run is a background job and this call returns within a few " +
         "seconds: if `status` is not `done`, poll claude_get_session with `job_id` until `local_job.status` is " +
         "`done` or the call returns an error. The final result has the session_id (pass it as `resume` to " +
         "continue), the result text, turns, cost and usage, denied tools, and the files git status lists. " +
@@ -1038,9 +1045,11 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
           maxTurns: max_turns ?? null,
           allowedTools: allowed_tools ?? [],
           resume: resume ?? null,
+          restricted: !config.localAllowShell,
         }),
         cwd: realCwd,
         permissionMode,
+        restricted: !config.localAllowShell,
         timeoutMs: timeout_s === undefined ? config.timeoutMs : timeout_s * 1_000,
         scope: new Scope(),
         parser: new LocalStreamParser(),
@@ -1107,7 +1116,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     files: LocalBody["files"],
     output: LocalBody["cli"],
   ): LocalBody {
-    const { args, cwd, permissionMode, parser } = job.details;
+    const { args, cwd, permissionMode, restricted, parser } = job.details;
     const final = parser.result;
     return {
       job_id: job.id,
@@ -1116,6 +1125,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       session_id: parser.sessionId,
       cwd,
       permission_mode: permissionMode,
+      restricted,
       assistant_messages: parser.assistantMessages,
       parsed: final !== null,
       subtype: final?.subtype ?? null,

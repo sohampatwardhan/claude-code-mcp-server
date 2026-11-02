@@ -95,6 +95,14 @@ export interface LocalRunOptions {
   maxTurns: number | null;
   allowedTools: readonly LocalAllowedTool[];
   resume: string | null;
+  /**
+   * Run in Claude Code's restricted mode with no MCP servers: no tools that
+   * run commands or code, no WebFetch, no user or project settings files
+   * (so no checkout hooks, allow rules or `.mcp.json`), file tools confined
+   * to the working directory, and writes to settings and git files refused.
+   * Set whenever the operator has not allowed shell access.
+   */
+  restricted: boolean;
 }
 
 /**
@@ -103,7 +111,7 @@ export interface LocalRunOptions {
  * file's `defaultMode` can't turn a run into `bypassPermissions`.
  */
 export function localRunArgv(options: LocalRunOptions): string[] {
-  const { prompt, permissionMode, model, maxTurns, allowedTools, resume } = options;
+  const { prompt, permissionMode, model, maxTurns, allowedTools, resume, restricted } = options;
   if (!(LOCAL_PERMISSION_MODES as readonly string[]).includes(permissionMode)) {
     throw new Error("internal error: local permission mode is not allowed");
   }
@@ -117,7 +125,9 @@ export function localRunArgv(options: LocalRunOptions): string[] {
   if (resume !== null && !LOCAL_SESSION_ID_PATTERN.test(resume)) {
     throw new Error("internal error: resume is not a session id");
   }
-  const argv = ["-p", "--output-format=stream-json", "--verbose", `--permission-mode=${permissionMode}`];
+  const argv = ["-p"];
+  if (restricted) argv.push("--restricted", "--strict-mcp-config");
+  argv.push("--output-format=stream-json", "--verbose", `--permission-mode=${permissionMode}`);
   if (model !== null) argv.push(`--model=${model}`);
   if (maxTurns !== null) argv.push(`--max-turns=${maxTurns}`);
   if (allowedTools.length > 0) argv.push(`--allowedTools=${[...new Set(allowedTools)].join(",")}`);

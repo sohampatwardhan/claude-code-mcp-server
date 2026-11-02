@@ -57,6 +57,7 @@ describe("local run argv", () => {
     maxTurns: null,
     allowedTools: [],
     resume: null,
+    restricted: false,
   };
 
   it("builds print-mode argv with a fixed flag order and the prompt after --", () => {
@@ -93,6 +94,19 @@ describe("local run argv", () => {
     );
   });
 
+  it("puts --restricted and --strict-mcp-config right after -p for a restricted run", () => {
+    assert.deepEqual(localRunArgv({ ...base, restricted: true }), [
+      "-p",
+      "--restricted",
+      "--strict-mcp-config",
+      "--output-format=stream-json",
+      "--verbose",
+      "--permission-mode=dontAsk",
+      "--",
+      "Fix the build",
+    ]);
+  });
+
   it("refuses bypass, unknown tools, a bad model or resume id, and a bad turn limit", () => {
     const bad = [
       { permissionMode: "bypassPermissions" },
@@ -106,7 +120,7 @@ describe("local run argv", () => {
       { maxTurns: 1.5 },
     ];
     for (const override of bad) {
-      assert.throws(() => localRunArgv({ ...base, ...override } as Parameters<typeof localRunArgv>[0]), /internal error/, JSON.stringify(override));
+      assert.throws(() => localRunArgv({ ...base, ...override } as unknown as Parameters<typeof localRunArgv>[0]), /internal error/, JSON.stringify(override));
     }
   });
 });

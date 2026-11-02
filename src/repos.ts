@@ -363,8 +363,9 @@ const MAX_STATUS_CHARS = 1024 * 1024;
  * `git status` of a local run's directory, as raw `--porcelain=v1 -z` text, or
  * null when the directory is not a git work tree, git fails, or the output
  * passes `MAX_STATUS_CHARS`. Read-only:
- * no optional locks, hooks and fsmonitor off, so the checkout's config can't
- * make status run a command.
+ * no optional locks, hooks, fsmonitor and submodules off. A clean filter
+ * from the checkout's git config can still run; a restricted run can't write
+ * git config, and one with shell access can run commands anyway.
  */
 export async function readGitStatus(cwd: string, timeoutMs: number): Promise<string | null> {
   const result = await runCommand(
@@ -379,6 +380,7 @@ export async function readGitStatus(cwd: string, timeoutMs: number): Promise<str
       "--porcelain=v1",
       "-z",
       "--untracked-files=all",
+      "--ignore-submodules=all",
     ],
     cwd,
     timeoutMs,

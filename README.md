@@ -21,7 +21,7 @@ It exposes six tools over stdio: create a cloud session, queue a follow-up messa
 - **Deterministic argv.** Arguments are built from validated inputs in a fixed order and passed as an array (`shell: false`). Values are attached as `--flag=value`, or placed after `--`, so a value that starts with `-` can never be read as a flag. `claude --cloud=<description>` is executed on a pseudo-terminal because the CLI rejects that form when stdout is a pipe; the pty helper `exec`s the same argv and never goes through a shell.
 - **Structured outputs.** Every tool declares an `outputSchema` and returns `structuredContent` with parsed fields, such as `session_id` and `session_url`. CLI stdout and stderr are returned in `cli` with terminal control sequences removed.
 - **Cloud sessions.** Create and follow-up always pass `--cloud=`. Session status runs print-mode `claude --teleport=<session>` inside the server's cache so the CLI can check out the branch the cloud session pushed, then the process exits. That argv carries no prompt and is not attached to a terminal.
-- **Local runs are opt-in.** `claude_run_local` is the only tool that runs Claude Code on this machine (`claude -p`). It refuses every call until `CLAUDE_MCP_LOCAL_ROOTS` lists directories, only runs inside them (after resolving symlinks), always passes an explicit permission mode from a fixed set, and never bypasses permissions. Running shell commands unasked (pre-approved `Bash`, or `auto` mode) needs a second opt-in, `CLAUDE_MCP_LOCAL_ALLOW_SHELL`.
+- **Local runs are opt-in.** `claude_run_local` is the only tool that runs Claude Code on this machine (`claude -p`). It refuses every call until `CLAUDE_MCP_LOCAL_ROOTS` lists directories, only runs inside them (after resolving symlinks), always passes an explicit permission mode from a fixed set, and never bypasses permissions. Until a second opt-in, `CLAUDE_MCP_LOCAL_ALLOW_SHELL`, is set, every run uses Claude Code's `--restricted` mode: no shell or code-running tools, and the checkout's settings, hooks and `.mcp.json` aren't loaded.
 - **No orphaned processes.** Every child (git, `gh`, the pty helper, `claude`) leads its own process group and is tracked. A cancelled create, or an MCP request the client cancels (for example on its own timeout), stops its processes with SIGTERM, then SIGKILL 5 s later. When the client closes stdin, or the server gets SIGINT, SIGTERM or SIGHUP, the server stops every child before it exits. If the server is killed outright, the pty helper notices and stops `claude --cloud` the same way. Only `git` and `gh` processes that are already running can outlive a SIGKILL, and each is bound by `CLAUDE_MCP_TIMEOUT_MS`.
 - **No telemetry.** The server runs the local `claude` binary. Its own network calls are `git clone` / `git fetch` of a validated `https://github.com/owner/name.git` into the cache, and a read-only `gh pr list` when status needs a pull request number.
 
@@ -121,8 +121,8 @@ npm start                       # same as: node dist/src/index.js
 | `CLAUDE_MCP_CWD` | process working directory | Directory the CLI runs in when a call omits `repo`. `claude --cloud` packages this tree, and workspace trust is resolved from it. A relative path is resolved at startup. The path must exist and be a directory. |
 | `CLAUDE_MCP_REPOS` | empty | Comma-separated allowlist of local directories a create call may select. Each entry is an absolute directory that exists at startup. A github.com `owner/name` is accepted and ignored for access control: any github.com repository can be cloned into the cache. Other hosts, relative paths, and missing directories are rejected at startup. |
 | `CLAUDE_MCP_REPO_CACHE` | `~/.claude-mcp/repos` | Directory that holds checkouts of GitHub repositories named by a call. Created on first use. An existing path must be a directory. This directory is the allowlist for where clones are written. |
-| `CLAUDE_MCP_LOCAL_ROOTS` | empty (local runs off) | Comma-separated absolute directories `claude_run_local` may run in, together with everything under them. Each must exist at startup and is compared in its real-path form. **Listing a root trusts every checkout under it:** print mode skips Claude Code's workspace-trust dialog, so those checkouts' hooks, settings and allow rules apply. The filesystem root `/` is refused. |
-| `CLAUDE_MCP_LOCAL_ALLOW_SHELL` | off | `1` / `true` / `yes` lets a local run pre-approve `Bash` or use `permission_mode: "auto"`. Either one runs shell commands on this machine without asking, so they fail with `LOCAL_SHELL_DISABLED` until this is set. |
+| `CLAUDE_MCP_LOCAL_ROOTS` | empty (local runs off) | Comma-separated absolute directories `claude_run_local` may run in, together with everything under them. Each must exist at startup and is compared in its real-path form. The filesystem root `/` is refused. Print mode skips Claude Code's workspace-trust dialog; while `CLAUDE_MCP_LOCAL_ALLOW_SHELL` is off, `--restricted` keeps a checkout's settings from loading, but Claude still reads and edits every file under the roots. |
+| `CLAUDE_MCP_LOCAL_ALLOW_SHELL` | off | `1` / `true` / `yes` drops `--restricted` from local runs and lets them pre-approve `Bash` or use `permission_mode: "auto"`, either of which runs shell commands on this machine without asking. **It also trusts every checkout under the roots:** their project settings, hooks, allow rules and `.mcp.json` servers load as in a normal `claude -p`. Off, `Bash` and `auto` fail with `LOCAL_SHELL_DISABLED`. |
 
 If any of these values is invalid, the server exits at startup with code 2 and prints a message on stderr.
 
@@ -395,11 +395,17 @@ Follow-ups, session status and auth status need no cancel tool. When the client 
 
 Runs Claude Code headless on this machine, in an existing checkout, for work that needs the local toolchain or hardware rather than a cloud VM. Runs:
 
-`claude -p --output-format=stream-json --verbose --permission-mode=<mode> [--model=<model>] [--max-turns=<n>] [--allowedTools=<tools>] [--resume=<session_id>] -- <prompt>`
+`claude -p [--restricted --strict-mcp-config] --output-format=stream-json --verbose --permission-mode=<mode> [--model=<model>] [--max-turns=<n>] [--allowedTools=<tools>] [--resume=<session_id>] -- <prompt>`
 
 in `cwd`, stdin closed, stdout a pipe. It is off by default: with `CLAUDE_MCP_LOCAL_ROOTS` unset, every call fails with `LOCAL_RUNS_DISABLED`.
 
-**Trust.** Print mode doesn't show the workspace-trust dialog, so the checkout's project hooks, settings and allow rules apply to the run. Only list roots whose checkouts you'd open in Claude Code yourself.
+**Restricted unless you allow shell access.** With `CLAUDE_MCP_LOCAL_ALLOW_SHELL` off (the default), the run gets `--restricted --strict-mcp-config` ([restricted mode](https://code.claude.com/docs/en/cli-reference), Claude Code 2.1.248 or later; an older CLI rejects the flag and the run fails with `CLI_EXIT_NONZERO`). Claude Code then:
+- removes Bash, PowerShell and the other tools that run commands or code, and WebFetch
+- loads only managed settings: not your user settings, and not the checkout's `.claude/settings*.json`, hooks or allow rules
+- starts no MCP servers, including the checkout's `.mcp.json`
+- confines the file tools to `cwd`, and refuses writes to settings, git and tool-configuration files (there's no one to approve them)
+
+So a checkout can't give the run shell access, and the run can't rewrite `.git/config` or `.claude/` to give a later run shell access either. Print mode never shows the workspace-trust dialog. With `CLAUDE_MCP_LOCAL_ALLOW_SHELL=1` none of this applies: the checkout's settings, hooks and MCP servers load, so listing a root then trusts every checkout under it. Only turn it on for roots whose checkouts you'd open in Claude Code yourself.
 
 Input schema:
 
@@ -424,7 +430,7 @@ Input schema:
 - `cwd` must be an existing directory inside a `CLAUDE_MCP_LOCAL_ROOTS` root, or a root itself. Both are compared after `realpath`, so a symlink that leads out of a root is refused, one that leads into a root is allowed, and macOS `/var/...` and `/private/var/...` spellings agree. Anything else is `REPO_NOT_ALLOWED`, and the CLI is not started.
 - `permission_mode` defaults to `dontAsk`: reads and `allowed_tools` run, and anything that would prompt is denied (and listed in `permission_denials`). `acceptEdits` also allows file edits and common filesystem commands in `cwd`, `plan` is read-only exploration, and `auto` lets a background classifier review each action, shell commands included. The mode is always passed explicitly, so a settings file's `defaultMode` can't change it. `bypassPermissions` and `--dangerously-skip-permissions` are never used.
 - `allowed_tools` pre-approves built-in tools by name only. No patterns and no MCP tools. `Bash` allows every shell command.
-- **Shell access is a separate opt-in.** `allowed_tools` containing `Bash`, or `permission_mode: "auto"`, lets the run execute shell commands on this machine without asking anyone, with your user's credentials and network access. Both fail with `LOCAL_SHELL_DISABLED` unless `CLAUDE_MCP_LOCAL_ALLOW_SHELL=1`. Without it, `acceptEdits` still edits files and runs common filesystem commands (`mkdir`, `mv`, `cp`), and anything else that would prompt is denied. Commands the checkout's own settings allow still run in every mode.
+- **Shell access is a separate opt-in.** `allowed_tools` containing `Bash`, or `permission_mode: "auto"`, lets the run execute shell commands on this machine without asking anyone, with your user's credentials and network access. Both fail with `LOCAL_SHELL_DISABLED` unless `CLAUDE_MCP_LOCAL_ALLOW_SHELL=1`. Without it the run is restricted (above): file reads and, in `acceptEdits`, file edits in `cwd`. `WebFetch` in `allowed_tools` then has no effect, because restricted mode removes it.
 - `resume` is the `session_id` of an earlier run. Claude Code finds the session by id, and may continue it under a new id; the result's `session_id` is the one to resume next.
 - `timeout_s` overrides `CLAUDE_MCP_TIMEOUT_MS` for this run.
 
@@ -438,11 +444,12 @@ Like create, the run is a background job and the call returns within about 2 sec
   "session_id": "1f0e2c9a-6d0b-4c11-9f39-2a77c1d4e8b5",
   "cwd": "/Users/dev/GitRepos/app",
   "permission_mode": "acceptEdits",
+  "restricted": true,
   "assistant_messages": 6,
   "parsed": true,
   "subtype": "success",
   "is_error": false,
-  "result": "Fixed the failing test in src/parse.ts and ran npm test.",
+  "result": "Fixed the failing test in src/parse.ts.",
   "num_turns": 7,
   "total_cost_usd": 0.0421,
   "usage": { "input_tokens": 1200, "output_tokens": 950, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 18000 },
@@ -452,7 +459,7 @@ Like create, the run is a background job and the call returns within about 2 sec
     { "path": "src/parse.ts", "status": " M", "from": null, "before": null },
     { "path": "notes.md", "status": " M", "from": null, "before": " M" }
   ],
-  "args": ["-p", "--output-format=stream-json", "--verbose", "--permission-mode=acceptEdits", "--", "Fix the failing test"],
+  "args": ["-p", "--restricted", "--strict-mcp-config", "--output-format=stream-json", "--verbose", "--permission-mode=acceptEdits", "--", "Fix the failing test"],
   "cli": { "exit_code": 0, "stdout": "", "stderr": "" }
 }
 ```

@@ -1186,6 +1186,7 @@ describe("claude_run_local", () => {
     session_id: string | null;
     cwd: string;
     permission_mode: string;
+    restricted: boolean;
     assistant_messages: number;
     parsed: boolean;
     subtype: string | null;
@@ -1256,6 +1257,7 @@ describe("claude_run_local", () => {
       const body = outer.local_job;
       assert.equal(body.cwd, repo);
       assert.equal(body.permission_mode, "dontAsk");
+      assert.equal(body.restricted, true);
       assert.equal(body.parsed, true);
       assert.equal(body.subtype, "success");
       assert.equal(body.is_error, false);
@@ -1276,6 +1278,8 @@ describe("claude_run_local", () => {
       assert.equal(body.cli.stdout, "", "the stream-json transcript is not returned");
       assert.deepEqual(argvCalls()[0], [
         "-p",
+        "--restricted",
+        "--strict-mcp-config",
         "--output-format=stream-json",
         "--verbose",
         "--permission-mode=dontAsk",
@@ -1298,6 +1302,8 @@ describe("claude_run_local", () => {
       assert.equal(nextBody.result, "Done: keep going");
       assert.deepEqual(argvCalls()[1], [
         "-p",
+        "--restricted",
+        "--strict-mcp-config",
         "--output-format=stream-json",
         "--verbose",
         "--permission-mode=acceptEdits",
@@ -1334,6 +1340,10 @@ describe("claude_run_local", () => {
       }
       assert.ok(on.argvCalls()[0]?.includes("--allowedTools=Read,Bash"));
       assert.ok(on.argvCalls()[1]?.includes("--permission-mode=auto"));
+      for (const argv of on.argvCalls()) {
+        assert.equal(argv.includes("--restricted"), false, "shell runs load settings normally");
+        assert.equal(argv.includes("--strict-mcp-config"), false);
+      }
     } finally {
       await on.close();
     }
