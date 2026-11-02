@@ -1,7 +1,7 @@
 {
   "name": "@sohampatwardhan/claude-code-mcp-server",
   "version": "0.1.0",
-  "description": "MCP server that lets AI agents (Muse, Grok, and other MCP clients) orchestrate Claude Code cloud sessions natively via the Claude Code CLI.",
+  "description": "MCP server that lets AI agents (Muse, Grok, and other MCP clients) orchestrate Claude Code cloud sessions via the Claude Code CLI. Requires @anthropic-ai/claude-code installed and signed in (run `claude` once).",
   "license": "MIT",
   "author": "Soham Patwardhan",
   "homepage": "https://github.com/sohampatwardhan/claude-code-mcp-server",
@@ -32,13 +32,16 @@
     "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/src/index.js', 0o755)\"",
     "prepack": "npm run build",
     "start": "node dist/src/index.js",
-    "test": "npm run build && node --test dist/test/parse.test.js dist/test/argv-config.test.js dist/test/trust.test.js dist/test/repos.test.js dist/test/smoke.test.js"
+    "test": "npm run build && node --test dist/test/parse.test.js dist/test/argv-config.test.js dist/test/trust.test.js dist/test/repos.test.js dist/test/prereq.test.js dist/test/smoke.test.js"
   },
   "keywords": [
     "mcp",
     "model-context-protocol",
     "claude-code",
-    "cloud-sessions"
+    "cloud-sessions",
+    "claude",
+    "anthropic",
+    "claude-code-cli"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",

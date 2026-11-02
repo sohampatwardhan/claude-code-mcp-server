@@ -26,6 +26,7 @@ src/runner.ts    pipe spawn, timeout, 4 MiB output cap (follow-up and auth)
 src/pty.ts       Python pty helper for create; execs the CLI with no shell
 src/trust.ts     detect the workspace-trust dialog; optional ~/.claude.json edit
 src/parse.ts     turn CLI text into structured fields
+src/prereq.ts    CLI install/sign-in messages, PATH lookup, login-error detection
 src/repos.ts     repo allowlist, GitHub cache clone/fetch/checkout, session records, gh pr lookup
 test/fixtures/fake-claude.mjs   stand-in CLI used by the smoke test (including teleport)
 test/fixtures/fake-gh.mjs       stand-in gh used by session-status smoke cases
@@ -48,7 +49,7 @@ npm start       # node dist/src/index.js (stdio; idle until an MCP client connec
 
 There is no separate lint script and no ESLint or Prettier config. `npm run build` is the static check: `strict`, `noUncheckedIndexedAccess`, `noImplicitOverride`. Do not add a linter unless the change is explicitly about linting.
 
-`npm test` runs, in order: `dist/test/parse.test.js`, `dist/test/argv-config.test.js`, `dist/test/trust.test.js`, `dist/test/repos.test.js`, `dist/test/smoke.test.js`. Tests import the compiled `.js` next to the sources. The smoke fixtures stay at `test/fixtures/fake-claude.mjs` and `test/fixtures/fake-gh.mjs` and are not compiled.
+`npm test` runs, in order: `dist/test/parse.test.js`, `dist/test/argv-config.test.js`, `dist/test/trust.test.js`, `dist/test/repos.test.js`, `dist/test/prereq.test.js`, `dist/test/smoke.test.js`. Tests import the compiled `.js` next to the sources. The smoke fixtures stay at `test/fixtures/fake-claude.mjs` and `test/fixtures/fake-gh.mjs` and are not compiled.
 
 Runtime environment variables (all optional; invalid values exit the process with code 2):
 
@@ -86,9 +87,10 @@ When you change behavior, extend the test that owns it:
 
 - Parser regexes and output shapes: `test/parse.test.ts`, using transcripts shaped like real CLI output (labelled lines, JSON lines, ANSI, the trust dialog).
 - Argv order and config validation: `test/argv-config.test.ts`.
+- Missing-CLI and sign-in messages, PATH lookup, and login-error detection: `test/prereq.test.ts`.
 - Repo allowlist, path checks, the GitHub cache, and base branch: `test/repos.test.ts` (local bare repos, no network).
 - Trust-dialog detection, `~/.claude.json` edits, and worktree path resolution: `test/trust.test.ts`. These use a temp directory, not the developer's `~/.claude.json`.
-- Tool wiring over stdio (schemas, server instructions, create, follow-up, session status, auth, failures, trust refusal and accept): `test/smoke.test.ts`. Drive modes with `FAKE_CLAUDE_MODE`, `FAKE_CLAUDE_TRUST`, `FAKE_TELEPORT_*`, and `FAKE_GH_*`. Do not point tests at a real `claude` binary.
+- Tool wiring over stdio (schemas, server instructions, create, follow-up, session status, auth, failures, trust refusal and accept): `test/smoke.test.ts`. Drive modes (including `signed_out`) with `FAKE_CLAUDE_MODE`, `FAKE_CLAUDE_TRUST`, `FAKE_TELEPORT_*`, and `FAKE_GH_*`. Do not point tests at a real `claude` binary.
 
 Create smoke cases need Python 3 because they go through the pty helper even when the child is the fake CLI.
 

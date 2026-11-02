@@ -2,6 +2,14 @@
 
 MCP server that lets AI agents with an always-on cloud computer (e.g. Muse by Meta, Grok Bot by SpaceXSI, ChatGPT Dots by OpenAI, etc) orchestrate Claude Code cloud sessions natively via the Claude Code CLI.
 
+> **Requires the Claude Code CLI, installed and signed in, on the machine that runs this server.**
+>
+> 1. Install it: `npm install -g @anthropic-ai/claude-code`
+> 2. Sign in: run `claude` once in a terminal and complete the claude.ai login (`claude auth status` should then report `"loggedIn": true`).
+> 3. Cloud sessions need a claude.ai account with [Claude Code on the web](https://code.claude.com/docs/en/claude-code-on-the-web), and the Claude GitHub app on the repositories sessions work in.
+>
+> Without the CLI, every tool returns `CLI_NOT_FOUND` with the install command (and the server prints the same warning on stderr at startup). When the CLI is not signed in, tools return `CLI_NOT_SIGNED_IN`, which says to sign in with `claude` first.
+
 It exposes four tools over stdio: create a cloud session, queue a follow-up message into one, read the GitHub branch and pull request a session produced, and check the CLI's sign-in state. Each tool maps to one fixed `claude` invocation, and each returns structured JSON. Agents call typed tools and get typed results back, so they never need to write shell commands.
 
 ## Design
@@ -16,7 +24,7 @@ It exposes four tools over stdio: create a cloud session, queue a follow-up mess
 ## Prerequisites
 
 - Node.js 20 or later
-- The [Claude Code CLI](https://code.claude.com/docs), installed and signed in (`claude auth status` should report `"loggedIn": true`), with cloud sessions available on your account
+- The [Claude Code CLI](https://code.claude.com/docs) (`npm install -g @anthropic-ai/claude-code`), signed in by running `claude` once and completing the claude.ai login (`claude auth status` should report `"loggedIn": true`). The account needs cloud sessions (Claude Code on the web). Set `CLAUDE_BIN` when `claude` is not on the server's `PATH`.
 - Python 3 (the standard library only: `pty`, `fcntl`, `termios`) for `claude_create_cloud_session`. No pip packages. Follow-ups, session status, and auth status do not need Python. On Debian/Ubuntu this is the `python3` package, which is usually already installed.
 - Git on `PATH`, when a call names a github.com repository. The server runs `git` with a fixed argument list and `core.hooksPath=/dev/null`.
 - The Claude GitHub app installed on each private repository the cloud VM should clone, push, or open a pull request in. Public repositories can be cloned once the claude.ai account is connected to GitHub. See [GitHub access](#github-access) below.
@@ -357,7 +365,8 @@ Failures come back as MCP tool errors (`isError: true`). The text content block 
 | --- | --- |
 | `CLI_EXIT_NONZERO` | The CLI exited non-zero or was killed by a signal. `message` includes the stderr text. |
 | `CLI_TIMEOUT` | The CLI ran longer than `CLAUDE_MCP_TIMEOUT_MS`. |
-| `CLI_NOT_FOUND` | `CLAUDE_BIN` could not be found. `cli` is `null`. |
+| `CLI_NOT_FOUND` | `CLAUDE_BIN` could not be found. `message` names the install command (`npm install -g @anthropic-ai/claude-code`) and the sign-in step. `cli` is `null` on the pipe path. |
+| `CLI_NOT_SIGNED_IN` | The CLI exited non-zero with output that reads like a missing or expired login (for example `Invalid API key · Please run /login`, or `claude auth status` printing `"loggedIn": false`). `message` says to sign in with `claude` first. |
 | `CLI_SPAWN_FAILED` | The process could not be started for another reason. `cli` is `null`. |
 | `OUTPUT_PARSE_FAILED` | `claude auth status` did not print JSON with a boolean `loggedIn`. |
 | `PTY_UNAVAILABLE` | Create could not start the Python interpreter that allocates the pseudo-terminal (`CLAUDE_MCP_PYTHON`). `cli` is `null`. |
