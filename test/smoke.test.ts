@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const serverEntry = join(root, "dist/src/index.js");
@@ -60,13 +60,13 @@ async function connect(extraEnv: Record<string, string> = {}) {
       return [];
     }
   };
-  const metaCalls = (): { cwd: string; stdoutIsTTY: boolean; stdinIsTTY: boolean }[] => {
+  const metaCalls = (): { cwd: string; pid: number; stdoutIsTTY: boolean; stdinIsTTY: boolean }[] => {
     try {
       return readFileSync(metaLog, "utf8")
         .trim()
         .split("\n")
         .filter(Boolean)
-        .map((l) => JSON.parse(l) as { cwd: string; stdoutIsTTY: boolean; stdinIsTTY: boolean });
+        .map((l) => JSON.parse(l) as { cwd: string; pid: number; stdoutIsTTY: boolean; stdinIsTTY: boolean });
     } catch {
       return [];
     }
@@ -78,7 +78,15 @@ async function connect(extraEnv: Record<string, string> = {}) {
       return Buffer.alloc(0);
     }
   };
-  return { client, argvCalls, metaCalls, stdinBytes, stderr: () => stderrText, close: () => client.close() };
+  return {
+    client,
+    argvCalls,
+    metaCalls,
+    stdinBytes,
+    serverPid: transport.pid,
+    stderr: () => stderrText,
+    close: () => client.close(),
+  };
 }
 
 function git(args: string[], cwd?: string): void {
@@ -161,6 +169,23 @@ async function pollJob(
   }
 }
 
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor(check: () => boolean, ms: number, what: string): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+  }
+}
+
 function errorBody(result: CallToolResult): { error: { code: string; message: string } } {
   assert.equal(result.isError, true);
   const first = result.content[0];
@@ -169,12 +194,13 @@ function errorBody(result: CallToolResult): { error: { code: string; message: st
 }
 
 describe("stdio smoke test", () => {
-  it("lists exactly the four tools, each with a strict input schema", async () => {
+  it("lists exactly the five tools, each with a strict input schema", async () => {
     const { client, close } = await connect();
     try {
       const { tools } = await client.listTools();
       assert.deepEqual(tools.map((t) => t.name).sort(), [
         "claude_auth_status",
+        "claude_cancel_session",
         "claude_create_cloud_session",
         "claude_get_session",
         "claude_send_followup",
@@ -187,6 +213,8 @@ describe("stdio smoke test", () => {
       const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
       assert.deepEqual(byName.claude_create_cloud_session?.inputSchema.required, ["description"]);
       assert.deepEqual(byName.claude_get_session?.inputSchema.required, ["session"]);
+      assert.deepEqual(byName.claude_cancel_session?.inputSchema.required, ["session"]);
+      assert.match(byName.claude_cancel_session?.description ?? "", /does not stop a cloud session/);
       assert.deepEqual(byName.claude_send_followup?.inputSchema.required?.slice().sort(), ["message", "session"]);
       assert.deepEqual(byName.claude_auth_status?.inputSchema.properties, {});
       assert.match(client.getInstructions() ?? "", /can't push its branch to GitHub/);
@@ -330,6 +358,12 @@ describe("stdio smoke test", () => {
         { name: "claude_create_cloud_session", arguments: { description: "x", repo: "https://user:token@github.com/acme/widgets" } },
         { name: "claude_create_cloud_session", arguments: { description: "x", base_branch: "-rf" } },
         { name: "claude_create_cloud_session", arguments: { description: "x", base_branch: "a/../../b" } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", timeout_s: 0 } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", timeout_s: 1.5 } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", timeout_s: 86_401 } },
+        { name: "claude_create_cloud_session", arguments: { description: "x", idle_timeout_s: 0 } },
+        { name: "claude_cancel_session", arguments: {} },
+        { name: "claude_cancel_session", arguments: { session: "--all" } },
         { name: "claude_get_session", arguments: {} },
         { name: "claude_get_session", arguments: { session: "session_01ABCDEFGH", repo: "/tmp" } },
         { name: "claude_get_session", arguments: { session: "job_xyz" } },
@@ -898,6 +932,168 @@ describe("stdio smoke test", () => {
       assert.deepEqual(argvCalls(), []);
     } finally {
       await close();
+    }
+  });
+  it("cancels a hung create job and stops its processes", async () => {
+    const { client, metaCalls, close } = await connect({ FAKE_CLAUDE_MODE: "hang" });
+    try {
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "hangs forever" },
+      })) as CallToolResult;
+      const pending = created.structuredContent as { job_id: string; status: string };
+      assert.equal(pending.status, "starting");
+      await waitFor(() => metaCalls().length > 0, 5_000, "the fake CLI to start");
+      const pid = metaCalls()[0]?.pid ?? 0;
+      assert.ok(alive(pid));
+
+      const started = Date.now();
+      const cancel = (await client.callTool({
+        name: "claude_cancel_session",
+        arguments: { session: pending.job_id },
+      })) as CallToolResult;
+      assert.notEqual(cancel.isError, true);
+      const body = cancel.structuredContent as { job: { status: string; job_id: string }; cancelled: boolean; stopped: boolean };
+      assert.equal(body.cancelled, true);
+      assert.equal(body.stopped, true);
+      assert.equal(body.job.status, "cancelled");
+      assert.equal(body.job.job_id, pending.job_id);
+      assert.ok(Date.now() - started < 7_000);
+      assert.equal(alive(pid), false, "claude --cloud should be gone");
+
+      const read = (await client.callTool({
+        name: "claude_get_session",
+        arguments: { session: pending.job_id },
+      })) as CallToolResult;
+      assert.equal((read.structuredContent as { job: { status: string } }).job.status, "cancelled");
+      const again = (await client.callTool({
+        name: "claude_cancel_session",
+        arguments: { session: pending.job_id },
+      })) as CallToolResult;
+      assert.equal((again.structuredContent as { cancelled: boolean }).cancelled, false);
+    } finally {
+      await close();
+    }
+  });
+
+  it("cancels a job by the session id it printed, and leaves finished jobs alone", async () => {
+    const { client, metaCalls, close } = await connect({
+      FAKE_CLAUDE_CREATE_DELAY_MS: "2500",
+      FAKE_CLAUDE_CREATE_LINGER_MS: "60000",
+    });
+    try {
+      const unknown = (await client.callTool({
+        name: "claude_cancel_session",
+        arguments: { session: "session_01NothingRunning000000" },
+      })) as CallToolResult;
+      assert.equal(errorBody(unknown).error.code, "JOB_NOT_FOUND");
+      assert.match(errorBody(unknown).error.message, /does not stop a cloud session/);
+
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "lingers" },
+      })) as CallToolResult;
+      const jobId = (created.structuredContent as { job_id: string }).job_id;
+      await pollJob(client, jobId, (job) => job.status === "running");
+      const pid = metaCalls()[0]?.pid ?? 0;
+      const cancel = (await client.callTool({
+        name: "claude_cancel_session",
+        arguments: { session: "https://claude.ai/code/session_01FakeSessionId0000000000" },
+      })) as CallToolResult;
+      const body = cancel.structuredContent as { job: { status: string; session_id: string }; cancelled: boolean };
+      assert.equal(body.cancelled, true);
+      assert.equal(body.job.status, "cancelled");
+      assert.equal(body.job.session_id, "session_01FakeSessionId0000000000");
+      assert.equal(alive(pid), false);
+    } finally {
+      await close();
+    }
+
+    const fast = await connect();
+    try {
+      const created = (await fast.client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "quick" },
+      })) as CallToolResult;
+      const done = created.structuredContent as { job_id: string; status: string };
+      assert.equal(done.status, "done");
+      const cancel = (await fast.client.callTool({
+        name: "claude_cancel_session",
+        arguments: { session: done.job_id },
+      })) as CallToolResult;
+      const body = cancel.structuredContent as { job: { status: string }; cancelled: boolean; stopped: boolean };
+      assert.equal(body.cancelled, false);
+      assert.equal(body.stopped, true);
+      assert.equal(body.job.status, "done");
+    } finally {
+      await fast.close();
+    }
+  });
+
+  it("stops a create that prints nothing for idle_timeout_s", async () => {
+    const { client, close } = await connect({ FAKE_CLAUDE_MODE: "hang" });
+    try {
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "silent", idle_timeout_s: 1 },
+      })) as CallToolResult;
+      const result =
+        created.isError === true
+          ? created
+          : await pollJob(client, (created.structuredContent as { job_id: string }).job_id, () => false);
+      const body = errorBody(result);
+      assert.equal(body.error.code, "CLI_TIMEOUT");
+      assert.match(body.error.message, /printed nothing for 1000 ms/);
+    } finally {
+      await close();
+    }
+  });
+
+  it("stops a follow-up when the client cancels the request", async () => {
+    const { client, metaCalls, close } = await connect({ FAKE_CLAUDE_MODE: "hang" });
+    try {
+      const controller = new AbortController();
+      const call = client
+        .callTool(
+          { name: "claude_send_followup", arguments: { session: "session_01Target00000000", message: "hi" } },
+          CallToolResultSchema,
+          { signal: controller.signal },
+        )
+        .catch((err: unknown) => err);
+      await waitFor(() => metaCalls().length > 0, 5_000, "the fake CLI to start");
+      const pid = metaCalls()[0]?.pid ?? 0;
+      controller.abort();
+      await call;
+      await waitFor(() => !alive(pid), 7_000, "the follow-up CLI to exit");
+    } finally {
+      await close();
+    }
+  });
+
+  it("stops every child when the client closes stdin", async () => {
+    const { client, metaCalls, close, serverPid } = await connect({ FAKE_CLAUDE_MODE: "hang" });
+    await client.callTool({ name: "claude_create_cloud_session", arguments: { description: "left running" } });
+    await waitFor(() => metaCalls().length > 0, 5_000, "the fake CLI to start");
+    const pid = metaCalls()[0]?.pid ?? 0;
+    assert.ok(alive(pid));
+    await close();
+    await waitFor(() => !alive(pid), 7_000, "claude --cloud to exit after the client closed");
+    if (serverPid !== null && serverPid !== undefined) {
+      await waitFor(() => !alive(serverPid), 7_000, "the server to exit");
+    }
+  });
+
+  it("stops claude --cloud even when the server is killed outright", async () => {
+    const { client, metaCalls, close, serverPid } = await connect({ FAKE_CLAUDE_MODE: "hang" });
+    try {
+      await client.callTool({ name: "claude_create_cloud_session", arguments: { description: "orphan" } });
+      await waitFor(() => metaCalls().length > 0, 5_000, "the fake CLI to start");
+      const pid = metaCalls()[0]?.pid ?? 0;
+      assert.ok(serverPid);
+      process.kill(serverPid, "SIGKILL");
+      await waitFor(() => !alive(pid), 7_000, "the pty helper to stop claude after the server died");
+    } finally {
+      await close().catch(() => undefined);
     }
   });
 });

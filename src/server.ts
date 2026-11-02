@@ -6,6 +6,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import { authStatusArgv, createSessionArgv, sendFollowupArgv, teleportArgv } from "./argv.js";
+import { KILL_GRACE_MS, Scope, abortOnSignal, runInScope } from "./children.js";
 import { ENVIRONMENT_ID_PATTERN, type Config } from "./config.js";
 import { JOB_ID_PATTERN, JobStore, settleWithin, type Job, type JobStatus } from "./jobs.js";
 import { cliNotFoundMessage, isSignInError, signInMessage } from "./prereq.js";
@@ -54,7 +55,8 @@ export const SERVER_INSTRUCTIONS =
   "claude_create_cloud_session returns within a few seconds. When its status is not `done`, the session is " +
   "still being prepared in the background: call claude_get_session with the returned job_id every few seconds " +
   "until job.status is `done` (session_id and session_url are then set) or the call returns an error. Job ids " +
-  "are kept in this server's memory only.\n\n" +
+  "are kept in this server's memory only. claude_cancel_session stops a job that is stuck; it stops only " +
+  "processes on this machine, and a cloud session that was already created keeps running.\n\n" +
   "Check results with claude_get_session, which reports the " +
   "branch a session pushed and any pull request it opened; the conversation and replies are only visible at " +
   "the session's session_url.\n\n" +
@@ -84,6 +86,7 @@ export const TOOL_NAMES = [
   "claude_create_cloud_session",
   "claude_send_followup",
   "claude_get_session",
+  "claude_cancel_session",
   "claude_auth_status",
 ] as const;
 
@@ -139,6 +142,22 @@ const createInput = z
       .describe(
         "Branch the cloud VM should clone, for a github.com repo. The cache checkout is moved to this branch before claude --cloud. Omit to use the remote's default branch. Not applied to a local directory.",
       ),
+    timeout_s: z
+      .number()
+      .int()
+      .min(1)
+      .max(86_400)
+      .optional()
+      .describe("Per-process time limit for this create's git steps and claude --cloud, in seconds. Omit to use CLAUDE_MCP_TIMEOUT_MS."),
+    idle_timeout_s: z
+      .number()
+      .int()
+      .min(1)
+      .max(86_400)
+      .optional()
+      .describe(
+        "Stop claude --cloud when it prints nothing for this many seconds. Omit to use CLAUDE_MCP_IDLE_TIMEOUT_MS (off when unset).",
+      ),
   })
   .strict();
 
@@ -174,6 +193,18 @@ const sessionInput = z
   })
   .strict();
 
+const cancelInput = z
+  .object({
+    session: z
+      .string()
+      .max(2_000)
+      .regex(SESSION_OR_JOB_PATTERN)
+      .describe(
+        "Create job to stop: its job id (job_...), or the session id (session_... / cse_...) or https://claude.ai/code/... URL an unfinished job printed.",
+      ),
+  })
+  .strict();
+
 const authInput = z.object({}).strict();
 
 const cliOutput = z
@@ -189,9 +220,9 @@ const createOutput = z
   .object({
     job_id: z.string().describe("Background job for this create. Pass it to claude_get_session until status is done."),
     status: z
-      .enum(["cloning", "starting", "running", "done"])
+      .enum(["cloning", "starting", "running", "done", "cancelled"])
       .describe(
-        "cloning: preparing the GitHub cache checkout. starting: claude --cloud is running and has not printed a session yet. running: the session id was printed and the CLI has not exited. done: the CLI exited and the result below is final.",
+        "cloning: preparing the GitHub cache checkout. starting: claude --cloud is running and has not printed a session yet. running: the session id was printed and the CLI has not exited. done: the CLI exited and the result below is final. cancelled: claude_cancel_session stopped the job; a session it already printed keeps running in the cloud.",
       ),
     elapsed_ms: z.number().int().describe("Time since the job started, or its total duration once done."),
     session_id: z.string().nullable(),
@@ -234,6 +265,16 @@ const sessionOutput = z
   })
   .strict();
 
+const cancelOutput = z
+  .object({
+    job: createOutput.describe("The job after this call."),
+    cancelled: z
+      .boolean()
+      .describe("True when this call cancelled the job. False when it had already finished or been cancelled."),
+    stopped: z.boolean().describe("True when every process the job started has exited."),
+  })
+  .strict();
+
 type CreateBody = z.infer<typeof createOutput>;
 
 /** Fixed fields of one create job. `cwd` and `baseBranch` are updated once the cache checkout is ready. */
@@ -243,6 +284,10 @@ interface CreateJob {
   cwd: string;
   repo: string | null;
   baseBranch: string | null;
+  /** Every process the job starts, so a cancel can stop them. */
+  scope: Scope;
+  timeoutMs: number;
+  idleTimeoutMs: number | null;
 }
 
 const followupOutput = z
@@ -301,13 +346,15 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     args: string[],
     projectPath: string,
     cwd: string,
+    limits: { timeoutMs: number; idleTimeoutMs: number | null },
     onProgress: (chunk: string) => void,
   ): Promise<PtyRunResult | CallToolResult> {
     let result: PtyRunResult;
     try {
-      result = await runCliPty(config.claudeBin, args, config.timeoutMs, {
+      result = await runCliPty(config.claudeBin, args, limits.timeoutMs, {
         pythonBin: config.pythonBin,
         cwd,
+        idleTimeoutMs: limits.idleTimeoutMs,
         onProgress,
         onOutput: (output) => {
           if (!isTrustPrompt(output)) return "wait";
@@ -322,7 +369,10 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       return toolError("WORKSPACE_NOT_TRUSTED", trustMessage(projectPath), args, result);
     }
     if (result.timedOut) {
-      return toolError("CLI_TIMEOUT", `claude timed out after ${config.timeoutMs} ms`, args, result);
+      return toolError("CLI_TIMEOUT", `claude timed out after ${limits.timeoutMs} ms`, args, result);
+    }
+    if (result.idleTimedOut) {
+      return toolError("CLI_TIMEOUT", `claude printed nothing for ${limits.idleTimeoutMs ?? 0} ms and was stopped`, args, result);
     }
     if (result.exitCode === 127 && cleanTerminalText(result.stdout).includes("claude binary not found:")) {
       return toolError(
@@ -360,7 +410,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       outputSchema: createOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ description, environment_id, repo, base_branch }) => {
+    async ({ description, environment_id, repo, base_branch, timeout_s, idle_timeout_s }, extra) => {
       const environmentId = environment_id ?? config.defaultEnvironmentId;
       let plan: CreatePlan;
       let cwd: string;
@@ -383,14 +433,24 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
         cwd,
         repo: plan.kind === "github" ? plan.github.slug : plan.kind === "path" ? plan.repo : null,
         baseBranch: plan.kind === "github" ? plan.baseBranch : null,
+        scope: new Scope(),
+        timeoutMs: timeout_s === undefined ? config.timeoutMs : timeout_s * 1_000,
+        idleTimeoutMs: idle_timeout_s === undefined ? config.idleTimeoutMs : idle_timeout_s * 1_000,
       };
       const target = plan;
       const job = jobs.start(details, plan.kind === "github" ? "cloning" : "starting", (started) =>
-        runCreateJob(started, target),
+        runInScope(started.details.scope, () => runCreateJob(started, target)),
       );
-      await settleWithin(job, CREATE_WAIT_MS);
-      if (job.failure !== null) throw job.failure.error;
-      return job.result ?? ok(pendingBody(job));
+      // A caller that cancels this request never learns the job id, so the job goes with it.
+      const onAbort = () => cancelJob(job);
+      extra.signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        await settleWithin(job, CREATE_WAIT_MS);
+      } finally {
+        extra.signal.removeEventListener("abort", onAbort);
+      }
+      const body = jobBody(job);
+      return isCreateBody(body) ? ok(body) : body;
     },
   );
 
@@ -403,7 +463,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
           config.repoCache,
           github.owner,
           github.name,
-          config.timeoutMs,
+          job.details.timeoutMs,
           plan.baseBranch,
           (cwd, branch) => {
             job.details.cwd = cwd;
@@ -420,8 +480,8 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
   }
 
   async function finishCreate(job: Job<CreateJob>, github: GithubRepo | null): Promise<CallToolResult> {
-    const { args, cwd, baseBranch } = job.details;
-    job.status = "starting";
+    const { args, cwd, baseBranch, timeoutMs, idleTimeoutMs } = job.details;
+    jobs.advance(job, "starting");
     const projectPath = await resolveTrustProjectPath(cwd);
     if (config.trustCwd) {
       try {
@@ -433,7 +493,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
         // Keystroke fallback below covers a dialog the file edit did not prevent.
       }
     }
-    const result = await runCreate(args, projectPath, cwd, (chunk) => {
+    const result = await runCreate(args, projectPath, cwd, { timeoutMs, idleTimeoutMs }, (chunk) => {
       if (job.output.length < MAX_JOB_OUTPUT_CHARS) job.output += chunk;
     });
     if (!isRunResult(result)) return result;
@@ -452,6 +512,13 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       }
     }
     return ok(createBody(job, "done", parsed, cli(result)));
+  }
+
+  /** Cancel `job` and stop its processes. Returns false when it had already finished or been cancelled. */
+  function cancelJob(job: Job<CreateJob>): boolean {
+    if (!jobs.cancel(job)) return false;
+    job.details.scope.abort();
+    return true;
   }
 
   function createBody(job: Job<CreateJob>, status: JobStatus, parsed: ParsedCreate, output: CreateBody["cli"]): CreateBody {
@@ -483,19 +550,31 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     });
   }
 
+  /**
+   * What a job reports now: progress while it runs or once cancelled, its
+   * final body when done, or its tool error when it failed.
+   */
+  function jobBody(job: Job<CreateJob>): CreateBody | CallToolResult {
+    if (job.status === "cancelled") return pendingBody(job);
+    if (job.failure !== null) throw job.failure.error;
+    if (job.result !== null && job.result.isError === true) return job.result;
+    return job.result !== null ? (job.result.structuredContent as CreateBody) : pendingBody(job);
+  }
+
+  function jobNotFound(what: string): CallToolResult {
+    return toolError(
+      "JOB_NOT_FOUND",
+      `No create job ${what} on this server. Jobs live in memory, are dropped an hour after they finish, and are lost when the server restarts. Use the session_id from a finished job, or create the session again.`,
+      [],
+    );
+  }
+
   /** claude_get_session for a job id: progress, the final result, or the job's tool error. */
   function readJob(id: string): CallToolResult {
     const job = jobs.get(id);
-    if (job === null) {
-      return toolError(
-        "JOB_NOT_FOUND",
-        `No create job ${id} on this server. Jobs live in memory, are dropped an hour after they finish, and are lost when the server restarts. Use the session_id from a finished job, or create the session again.`,
-        [],
-      );
-    }
-    if (job.failure !== null) throw job.failure.error;
-    if (job.result !== null && job.result.isError === true) return job.result;
-    const body = job.result !== null ? (job.result.structuredContent as CreateBody) : pendingBody(job);
+    if (job === null) return jobNotFound(id);
+    const body = jobBody(job);
+    if (!isCreateBody(body)) return body;
     return ok({
       job: body,
       session_id: body.session_id,
@@ -526,13 +605,14 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       outputSchema: followupOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ session, message }) => {
-      const args = sendFollowupArgv(session, message);
-      const result = await run(args);
-      if (!isRunResult(result)) return result;
-      const parsed = parseFollowupOutput(result.stdout);
-      return ok({ session, ...parsed, args, cli: cli(result) });
-    },
+    async ({ session, message }, extra) =>
+      inRequestScope(extra.signal, async () => {
+        const args = sendFollowupArgv(session, message);
+        const result = await run(args);
+        if (!isRunResult(result)) return result;
+        const parsed = parseFollowupOutput(result.stdout);
+        return ok({ session, ...parsed, args, cli: cli(result) });
+      }),
   );
 
   server.registerTool(
@@ -555,48 +635,52 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       outputSchema: sessionOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ session, repo }) => {
+    async ({ session, repo }, extra) => {
       if (JOB_ID_PATTERN.test(session)) return readJob(session);
-      const sessionId = sessionIdOf(session);
-      if (sessionId === null) {
-        return toolError("OUTPUT_PARSE_FAILED", `Could not read a session id from ${JSON.stringify(session)}.`, []);
-      }
-      const record = await readSessionRecord(config.repoCache, sessionId);
-      let github: GithubRepo | null = null;
-      let baseBranch: string | null = null;
-      if (repo !== undefined) {
-        github = parseGithubRepoArg(repo);
-        if (github === null) {
-          return toolError("REPO_NOT_ALLOWED", `Repository ${JSON.stringify(repo)} is not a github.com owner/name.`, []);
-        }
-        if (record !== null && record.repo === github.slug) baseBranch = record.base_branch;
-      } else if (record !== null) {
-        github = { kind: "github", slug: record.repo, owner: record.owner, name: record.name };
-        baseBranch = record.base_branch;
-      }
-      if (github === null) {
-        return toolError(
-          "SESSION_REPO_UNKNOWN",
-          "No GitHub repository is recorded for this session. Pass repo as owner/name. A repository is recorded when claude_create_cloud_session is called with a github.com repo.",
-          [],
-        );
-      }
-      const target = github;
-      try {
-        return await withPreparedGithubRepo(
-          config.repoCache,
-          target.owner,
-          target.name,
-          config.timeoutMs,
-          baseBranch,
-          (cwd, checkedOut) => readSessionStatus(sessionId, target, cwd, checkedOut),
-        );
-      } catch (err) {
-        if (err instanceof RepoPrepareError) return toolError("REPO_PREPARE_FAILED", err.message, []);
-        throw err;
-      }
+      return inRequestScope(extra.signal, () => readSession(session, repo));
     },
   );
+
+  async function readSession(session: string, repo: string | undefined): Promise<CallToolResult> {
+    const sessionId = sessionIdOf(session);
+    if (sessionId === null) {
+      return toolError("OUTPUT_PARSE_FAILED", `Could not read a session id from ${JSON.stringify(session)}.`, []);
+    }
+    const record = await readSessionRecord(config.repoCache, sessionId);
+    let github: GithubRepo | null = null;
+    let baseBranch: string | null = null;
+    if (repo !== undefined) {
+      github = parseGithubRepoArg(repo);
+      if (github === null) {
+        return toolError("REPO_NOT_ALLOWED", `Repository ${JSON.stringify(repo)} is not a github.com owner/name.`, []);
+      }
+      if (record !== null && record.repo === github.slug) baseBranch = record.base_branch;
+    } else if (record !== null) {
+      github = { kind: "github", slug: record.repo, owner: record.owner, name: record.name };
+      baseBranch = record.base_branch;
+    }
+    if (github === null) {
+      return toolError(
+        "SESSION_REPO_UNKNOWN",
+        "No GitHub repository is recorded for this session. Pass repo as owner/name. A repository is recorded when claude_create_cloud_session is called with a github.com repo.",
+        [],
+      );
+    }
+    const target = github;
+    try {
+      return await withPreparedGithubRepo(
+        config.repoCache,
+        target.owner,
+        target.name,
+        config.timeoutMs,
+        baseBranch,
+        (cwd, checkedOut) => readSessionStatus(sessionId, target, cwd, checkedOut),
+      );
+    } catch (err) {
+      if (err instanceof RepoPrepareError) return toolError("REPO_PREPARE_FAILED", err.message, []);
+      throw err;
+    }
+  }
 
   async function readSessionStatus(
     sessionId: string,
@@ -673,6 +757,52 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
   }
 
   server.registerTool(
+    "claude_cancel_session",
+    {
+      title: "Cancel a create job",
+      description:
+        "Stop a claude_create_cloud_session job that is still running: every process it started on this machine " +
+        "(git, the pty helper and claude --cloud) gets SIGTERM, then SIGKILL 5 s later. Pass the job_id, or the " +
+        "session id or URL an unfinished job already printed. Waits up to about 6 s for the processes to exit and " +
+        "reports `stopped`. This does not stop a cloud session: one the CLI already created keeps running at its " +
+        "session_url. A job that already finished is left as it is (`cancelled` false), and one that failed " +
+        "returns its error.",
+      inputSchema: cancelInput,
+      outputSchema: cancelOutput,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ session }) => {
+      let job: Job<CreateJob> | null;
+      if (JOB_ID_PATTERN.test(session)) {
+        job = jobs.get(session);
+        if (job === null) return jobNotFound(session);
+      } else {
+        const sessionId = sessionIdOf(session);
+        job = jobs.unfinished().find((candidate) => sessionId !== null && pendingBody(candidate).session_id === sessionId) ?? null;
+        if (job === null) {
+          return toolError(
+            "JOB_NOT_FOUND",
+            `No unfinished create job on this server printed session ${JSON.stringify(session)}. claude_cancel_session stops only processes this server started; it does not stop a cloud session, which keeps running at its session_url.`,
+            [],
+          );
+        }
+      }
+      const cancelled = cancelJob(job);
+      if (job.status !== "cancelled") {
+        const body = jobBody(job);
+        if (!isCreateBody(body)) return body;
+        return ok({ job: body, cancelled: false, stopped: job.details.scope.idle });
+      }
+      await settleWithin(job, KILL_GRACE_MS + 1_000);
+      return ok({
+        job: pendingBody(job),
+        cancelled,
+        stopped: job.finishedAt !== null && job.details.scope.idle,
+      });
+    },
+  );
+
+  server.registerTool(
     "claude_auth_status",
     {
       title: "Claude Code auth status",
@@ -684,20 +814,39 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       outputSchema: authOutput,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async () => {
-      const args = authStatusArgv();
-      const result = await run(args);
-      if (!isRunResult(result)) return result;
-      try {
-        return ok({ ...parseAuthStatus(result.stdout), cli: cli(result) });
-      } catch (err) {
-        if (err instanceof AuthParseError) return toolError("OUTPUT_PARSE_FAILED", err.message, args, result);
-        throw err;
-      }
-    },
+    async (_args, extra) =>
+      inRequestScope(extra.signal, async () => {
+        const args = authStatusArgv();
+        const result = await run(args);
+        if (!isRunResult(result)) return result;
+        try {
+          return ok({ ...parseAuthStatus(result.stdout), cli: cli(result) });
+        } catch (err) {
+          if (err instanceof AuthParseError) return toolError("OUTPUT_PARSE_FAILED", err.message, args, result);
+          throw err;
+        }
+      }),
   );
 
   return server;
+}
+
+/**
+ * Run a tool request in its own scope, so processes it starts are stopped
+ * when the client cancels the request (for example on its own timeout).
+ */
+async function inRequestScope<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
+  const scope = new Scope();
+  const detach = abortOnSignal(scope, signal);
+  try {
+    return await runInScope(scope, fn);
+  } finally {
+    detach();
+  }
+}
+
+function isCreateBody(value: CreateBody | CallToolResult): value is CreateBody {
+  return "job_id" in value;
 }
 
 // ---- result helpers ------------------------------------------------------

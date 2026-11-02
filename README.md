@@ -12,15 +12,16 @@ MCP server that lets AI agents with an always-on cloud computer (e.g. Muse by Me
 >
 > Without the CLI, every tool returns `CLI_NOT_FOUND` with the install command (and the server prints the same warning on stderr at startup). When the CLI is not signed in, tools return `CLI_NOT_SIGNED_IN`, which says to sign in with `claude` first.
 
-It exposes four tools over stdio: create a cloud session, queue a follow-up message into one, read the GitHub branch and pull request a session produced, and check the CLI's sign-in state. Each tool maps to one fixed `claude` invocation, and each returns structured JSON. Agents call typed tools and get typed results back, so they never need to write shell commands.
+It exposes five tools over stdio: create a cloud session, queue a follow-up message into one, read the GitHub branch and pull request a session produced, cancel a create that is stuck, and check the CLI's sign-in state. Each tool maps to one fixed `claude` invocation, and each returns structured JSON. Agents call typed tools and get typed results back, so they never need to write shell commands.
 
 ## Design
 
 - **Strict input schemas.** Every field is typed, required fields are listed explicitly, and every schema sets `additionalProperties: false`. Invalid input is rejected by schema validation before any process is spawned.
-- **No escape hatch.** The tool surface is exactly the four tools below. There is no "run any claude command" tool and no shell access.
+- **No escape hatch.** The tool surface is exactly the five tools below. There is no "run any claude command" tool and no shell access.
 - **Deterministic argv.** Arguments are built from validated inputs in a fixed order and passed as an array (`shell: false`). Values are attached as `--flag=value`, or placed after `--`, so a value that starts with `-` can never be read as a flag. `claude --cloud=<description>` is executed on a pseudo-terminal because the CLI rejects that form when stdout is a pipe; the pty helper `exec`s the same argv and never goes through a shell.
 - **Structured outputs.** Every tool declares an `outputSchema` and returns `structuredContent` with parsed fields, such as `session_id` and `session_url`. CLI stdout and stderr are returned in `cli` with terminal control sequences removed.
 - **Cloud sessions.** Create and follow-up always pass `--cloud=`. Session status runs print-mode `claude --teleport=<session>` inside the server's cache so the CLI can check out the branch the cloud session pushed, then the process exits. That argv carries no prompt and is not attached to a terminal.
+- **No orphaned processes.** Every child (git, `gh`, the pty helper, `claude`) leads its own process group and is tracked. A cancelled create, or an MCP request the client cancels (for example on its own timeout), stops its processes with SIGTERM, then SIGKILL 5 s later. When the client closes stdin, or the server gets SIGINT, SIGTERM or SIGHUP, the server stops every child before it exits. If the server is killed outright, the pty helper notices and stops `claude --cloud` the same way. Only `git` and `gh` processes that are already running can outlive a SIGKILL, and each is bound by `CLAUDE_MCP_TIMEOUT_MS`.
 - **No telemetry.** The server runs the local `claude` binary. Its own network calls are `git clone` / `git fetch` of a validated `https://github.com/owner/name.git` into the cache, and a read-only `gh pr list` when status needs a pull request number.
 
 ## Prerequisites
@@ -112,7 +113,8 @@ npm start                       # same as: node dist/src/index.js
 | --- | --- | --- |
 | `CLAUDE_BIN` | `claude` | Path or name of the Claude Code CLI binary. |
 | `CLAUDE_CLOUD_ENVIRONMENT_ID` | unset | Default cloud environment id (for example `ccpool_...`), passed as `--environment` when a call does not pass `environment_id`. |
-| `CLAUDE_MCP_TIMEOUT_MS` | `300000` | Hard timeout for each spawned CLI process, in milliseconds (positive integer). On timeout the process gets SIGTERM, then SIGKILL 5 s later. |
+| `CLAUDE_MCP_TIMEOUT_MS` | `300000` | Hard timeout for each spawned CLI process, in milliseconds (positive integer). On timeout the process gets SIGTERM, then SIGKILL 5 s later. A create call can override it with `timeout_s`. |
+| `CLAUDE_MCP_IDLE_TIMEOUT_MS` | unset (off) | Stop `claude --cloud` on create when it prints nothing for this many milliseconds (positive integer). A create call can override it with `idle_timeout_s`. Off by default, because packaging a large repository may print nothing for a while. |
 | `CLAUDE_MCP_TRUST_CWD` | unset (off) | `1`, `true`, or `yes` lets create accept Claude Code's workspace-trust dialog for `CLAUDE_MCP_CWD` only (the process working directory when that is unset). `0`, `false`, `no`, or unset leaves the dialog unanswered and the call fails with `WORKSPACE_NOT_TRUSTED`. |
 | `CLAUDE_MCP_PYTHON` | `python3` | Python 3 interpreter used to allocate the pseudo-terminal for create. |
 | `CLAUDE_MCP_CWD` | process working directory | Directory the CLI runs in when a call omits `repo`. `claude --cloud` packages this tree, and workspace trust is resolved from it. A relative path is resolved at startup. The path must exist and be a directory. |
@@ -184,9 +186,9 @@ Creates a new cloud session. Runs, on a pseudo-terminal: `claude --cloud=<descri
 **Create runs in the background and returns within about 2 seconds.** On a large repository the clone and `claude --cloud` can take minutes, longer than an MCP client waits for one request (60 seconds by default in the MCP SDK). The call starts a job, waits up to 2 seconds, then returns:
 
 - `status: "done"`: the job finished in time, and the fields below are final. A failure in that window comes back as the usual tool error.
-- `status: "cloning"`, `"starting"` or `"running"`: the job is still going. Call [`claude_get_session`](#claude_get_session) with `job_id` every few seconds until `job.status` is `"done"` or the call returns a tool error (the same codes as below). `cloning` means the GitHub cache checkout is being prepared. `starting` means `claude --cloud` is running and hasn't printed a session yet. `running` means it printed the session id (`session_id` and `session_url` are already set) and hasn't exited.
+- `status: "cloning"`, `"starting"` or `"running"`: the job is still going. Call [`claude_get_session`](#claude_get_session) with `job_id` every few seconds until `job.status` is `"done"` or the call returns a tool error (the same codes as below). `cloning` means the GitHub cache checkout is being prepared. `starting` means `claude --cloud` is running and hasn't printed a session yet. `running` means it printed the session id (`session_id` and `session_url` are already set) and hasn't exited. A job stopped with [`claude_cancel_session`](#claude_cancel_session) reports `cancelled`.
 
-Jobs live in the server's memory only. A finished job is kept for an hour (at most 100 finished jobs), and all jobs are lost when the server exits. Each job is still bound by `CLAUDE_MCP_TIMEOUT_MS`.
+Jobs live in the server's memory only. A finished job is kept for an hour (at most 100 finished jobs), and all jobs are lost when the server exits. Each process a job runs is bound by `timeout_s` (default `CLAUDE_MCP_TIMEOUT_MS`), and `claude --cloud` also by `idle_timeout_s` (default `CLAUDE_MCP_IDLE_TIMEOUT_MS`, off). Both time-outs fail with `CLI_TIMEOUT`. Use [`claude_cancel_session`](#claude_cancel_session) to stop a job early.
 
 The CLI rejects `--cloud` with a task description when stdout is a pipe (`--cloud requires an interactive terminal`). There is a non-interactive create form, `claude -p <task> --environment <ccpool>`, but it only targets self-hosted environments and it omits `--cloud`. This server keeps `--cloud=` on every create so an older CLI cannot fall through to a local session. A pty has a single output stream, so the CLI's stdout and stderr are both returned in `cli.stdout` (`cli.stderr` is empty on this tool). `cli.stdout` and `cli.stderr` have terminal control sequences removed (cursor save and restore, CSI including private parameters, and other C0 controls) before they are returned.
 
@@ -199,7 +201,9 @@ Input schema:
     "description": { "type": "string", "minLength": 1, "maxLength": 100000, "pattern": "\\S" },
     "environment_id": { "type": "string", "maxLength": 200, "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$" },
     "repo": { "type": "string", "minLength": 1, "maxLength": 4096 },
-    "base_branch": { "type": "string", "minLength": 1, "maxLength": 255 }
+    "base_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "timeout_s": { "type": "integer", "minimum": 1, "maximum": 86400 },
+    "idle_timeout_s": { "type": "integer", "minimum": 1, "maximum": 86400 }
   },
   "required": ["description"],
   "additionalProperties": false
@@ -350,6 +354,39 @@ Ready-to-send follow-up (replace `<base>` with the base branch, e.g. `main`):
 Pushing your branch to GitHub failed, so I'll apply your changes myself. Please commit any outstanding work, then run `git format-patch origin/<base>..HEAD --stdout` and paste the complete output in a single fenced code block, with nothing else inside it. If format-patch isn't possible, paste a full unified `git diff origin/<base>` that also includes new and deleted files (stage them first with `git add -A` and use `git diff --cached origin/<base>`). Don't try to push again.
 ```
 
+### `claude_cancel_session`
+
+Stops a create job that is still running. Every process the job started on this machine (git, the pty helper, `claude --cloud` and anything it started) gets SIGTERM, then SIGKILL 5 s later. The call waits up to about 6 s for them to exit. Runs no new process.
+
+**It does not stop a cloud session.** If `claude --cloud` already created one (the job's status was `running`), that session keeps running at its `session_url`. Open it there to stop it.
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "session": { "type": "string", "maxLength": 2000, "pattern": "<same as claude_get_session>" }
+  },
+  "required": ["session"],
+  "additionalProperties": false
+}
+```
+
+`session` is the job id, or the session id or URL that an unfinished job already printed. Output:
+
+```json
+{
+  "job": { "job_id": "job_5f0c2a9e7b1d43c8a6e2f019", "status": "cancelled", "session_id": null, "...": "..." },
+  "cancelled": true,
+  "stopped": true
+}
+```
+
+`cancelled` is `true` when this call cancelled the job. For a job that already finished or was already cancelled it is `false`, and `job` shows that job as it stands. A job that already failed returns its tool error. `stopped` is `true` when every process the job started has exited. After a cancel, `claude_get_session` reports the job with `status: "cancelled"`. A job id the server doesn't hold, or a session no unfinished job printed, returns `JOB_NOT_FOUND`.
+
+Follow-ups, session status and auth status need no cancel tool. When the client cancels one of those requests (MCP `notifications/cancelled`, which the SDK sends when its own request timeout fires), the server stops that request's processes.
+
 ### `claude_auth_status`
 
 Reports the CLI's sign-in state. Runs: `claude auth status`
@@ -391,7 +428,7 @@ Failures come back as MCP tool errors (`isError: true`). The text content block 
 | `code` | When |
 | --- | --- |
 | `CLI_EXIT_NONZERO` | The CLI exited non-zero or was killed by a signal. `message` includes the stderr text. |
-| `CLI_TIMEOUT` | The CLI ran longer than `CLAUDE_MCP_TIMEOUT_MS`. |
+| `CLI_TIMEOUT` | The CLI ran longer than `CLAUDE_MCP_TIMEOUT_MS` (or create's `timeout_s`), or `claude --cloud` printed nothing for `idle_timeout_s` / `CLAUDE_MCP_IDLE_TIMEOUT_MS`. |
 | `CLI_NOT_FOUND` | `CLAUDE_BIN` could not be found. `message` names the install command (`npm install -g @anthropic-ai/claude-code`) and the sign-in step. `cli` is `null` on the pipe path. |
 | `CLI_NOT_SIGNED_IN` | The CLI exited non-zero with output that reads like a missing or expired login (for example `Invalid API key · Please run /login`, or `claude auth status` printing `"loggedIn": false`). `message` says to sign in with `claude` first. |
 | `CLI_SPAWN_FAILED` | The process could not be started for another reason. `cli` is `null`. |
@@ -401,7 +438,7 @@ Failures come back as MCP tool errors (`isError: true`). The text content block 
 | `REPO_NOT_ALLOWED` | `repo` is not an absolute directory on `CLAUDE_MCP_REPOS` and not a github.com `owner/name`. The CLI is not started. |
 | `REPO_PREPARE_FAILED` | Preparing the GitHub cache checkout failed (git missing, clone or fetch error, `base_branch` missing on origin, `base_branch` passed for a local directory, lock timeout, or the cache directory has a different `origin`). |
 | `SESSION_REPO_UNKNOWN` | Session status was called without `repo` and this server has no record of a github.com repository for that session. |
-| `JOB_NOT_FOUND` | `claude_get_session` was given a job id this server doesn't hold: it was never issued, it finished more than an hour ago (or was pushed out by newer jobs), or the server restarted. Create the session again, or use the `session_id` from the finished job. |
+| `JOB_NOT_FOUND` | `claude_get_session` or `claude_cancel_session` was given a job id this server doesn't hold, or `claude_cancel_session` a session no unfinished job printed. A job id goes missing when: it was never issued, it finished more than an hour ago (or was pushed out by newer jobs), or the server restarted. Create the session again, or use the `session_id` from the finished job. |
 
 Schema violations (a missing required field, an unknown property, a value that doesn't match a pattern) are rejected by the MCP SDK's input validation as tool errors, and the CLI is never run.
 
@@ -448,12 +485,16 @@ src/
   runner.ts   child_process spawn with timeout and output caps (follow-up, session status, and auth)
   pty.ts      pseudo-terminal spawn used by create (embedded Python helper)
   trust.ts    workspace-trust dialog detection and the opt-in ~/.claude.json edit
+  jobs.ts     in-memory create jobs (ids, status, retention)
+  children.ts registry of child processes: process groups, cancel scopes, shutdown
   config.ts   environment variable parsing and validation
 test/
   parse.test.ts        parser unit tests against realistic CLI output
   argv-config.test.ts  argv and config unit tests
   repos.test.ts        allowlist, path checks, GitHub cache, and base branch
   trust.test.ts        trust-dialog detection, ~/.claude.json edits, worktree path
+  jobs.test.ts         job store: ids, status, retention
+  children.test.ts     process groups, scope cancel, stopAll
   smoke.test.ts        starts the built server over stdio and exercises every tool
   fixtures/fake-claude.mjs  stand-in CLI used by the smoke test (TTY, trust dialog, teleport)
   fixtures/fake-gh.mjs      stand-in gh used when session status looks up a pull request
