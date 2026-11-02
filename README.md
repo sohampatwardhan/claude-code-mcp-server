@@ -300,6 +300,21 @@ This tool does not return the assistant's latest reply. Open `session_url` from 
 
 On a self-hosted environment a Stop hook on the runner can capture replies (see [Test self-hosted environments](https://code.claude.com/docs/en/self-hosted-environments-testing)). That hook runs on the runner, outside this server.
 
+### If a session can't push
+
+Cloud sessions sometimes fail to push their branch to the GitHub remote. `claude_get_session` then returns no branch (teleport fails with `CLI_EXIT_NONZERO`), or the session says so at its `session_url`. When that happens, don't wait for a retry; move the changes through the calling agent instead:
+
+1. Use `claude_send_followup` to ask the session for a patch (prompt below).
+2. Copy the patch from the `session_url`. `claude_get_session` reports only the pushed branch and pull request, not replies, so the patch is visible only there.
+3. Apply it to your own checkout of the base branch with `git am` (for `format-patch` output) or `git apply --3way` (for a plain diff).
+4. Run the tests, commit, push, and open or update the pull request yourself.
+
+Ready-to-send follow-up (replace `<base>` with the base branch, e.g. `main`):
+
+```text
+Pushing your branch to GitHub failed, so I'll apply your changes myself. Please commit any outstanding work, then run `git format-patch origin/<base>..HEAD --stdout` and paste the complete output in a single fenced code block, with nothing else inside it. If format-patch isn't possible, paste a full unified `git diff origin/<base>` that also includes new and deleted files (stage them first with `git add -A` and use `git diff --cached origin/<base>`). Don't try to push again.
+```
+
 ### `claude_auth_status`
 
 Reports the CLI's sign-in state. Runs: `claude auth status`
