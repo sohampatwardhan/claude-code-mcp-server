@@ -1,5 +1,7 @@
 # Claude Code MCP Server
 
+[![npm version](https://img.shields.io/npm/v/@sohampatwardhan/claude-code-mcp-server.svg)](https://www.npmjs.com/package/@sohampatwardhan/claude-code-mcp-server)
+
 MCP server that lets AI agents with an always-on cloud computer (e.g. Muse by Meta, Grok Bot by SpaceXSI, ChatGPT Dots by OpenAI, etc) orchestrate Claude Code cloud sessions natively via the Claude Code CLI.
 
 > **Requires the Claude Code CLI, installed and signed in, on the machine that runs this server.**
