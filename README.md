@@ -435,7 +435,7 @@ test/
 
 ## Releasing
 
-The owner publishes `0.1.0` once from a maintainer machine. Trusted publishing on npmjs.com can be saved only after that package exists. Later versions then publish from the tag workflow. Skip the `v0.1.0` tag for this bootstrap: the workflow would try to publish `0.1.0` again.
+The owner published the first version, `0.1.1`, once from a maintainer machine (npm refused `0.1.0` because that version number had been used before). Trusted publishing on npmjs.com can be saved only after that package exists. Later versions then publish from the tag workflow. Skip the `v0.1.1` tag for this bootstrap: the workflow would try to publish `0.1.1` again.
 
 ```sh
 npm login
