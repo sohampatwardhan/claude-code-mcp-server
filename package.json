@@ -32,7 +32,7 @@
     "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/src/index.js', 0o755)\"",
     "prepack": "npm run build",
     "start": "node dist/src/index.js",
-    "test": "npm run build && node --test dist/test/parse.test.js dist/test/argv-config.test.js dist/test/trust.test.js dist/test/repos.test.js dist/test/prereq.test.js dist/test/smoke.test.js"
+    "test": "npm run build && node --test dist/test/parse.test.js dist/test/argv-config.test.js dist/test/trust.test.js dist/test/repos.test.js dist/test/prereq.test.js dist/test/jobs.test.js dist/test/smoke.test.js"
   },
   "keywords": [
     "mcp",

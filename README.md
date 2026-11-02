@@ -181,6 +181,13 @@ Every successful call returns `structuredContent` that matches the tool's `outpu
 
 Creates a new cloud session. Runs, on a pseudo-terminal: `claude --cloud=<description> [--environment=<id>]`
 
+**Create runs in the background and returns within about 2 seconds.** On a large repository the clone and `claude --cloud` can take minutes, longer than an MCP client waits for one request (60 seconds by default in the MCP SDK). The call starts a job, waits up to 2 seconds, then returns:
+
+- `status: "done"`: the job finished in time, and the fields below are final. A failure in that window comes back as the usual tool error.
+- `status: "cloning"`, `"starting"` or `"running"`: the job is still going. Call [`claude_get_session`](#claude_get_session) with `job_id` every few seconds until `job.status` is `"done"` or the call returns a tool error (the same codes as below). `cloning` means the GitHub cache checkout is being prepared. `starting` means `claude --cloud` is running and hasn't printed a session yet. `running` means it printed the session id (`session_id` and `session_url` are already set) and hasn't exited.
+
+Jobs live in the server's memory only. A finished job is kept for an hour (at most 100 finished jobs), and all jobs are lost when the server exits. Each job is still bound by `CLAUDE_MCP_TIMEOUT_MS`.
+
 The CLI rejects `--cloud` with a task description when stdout is a pipe (`--cloud requires an interactive terminal`). There is a non-interactive create form, `claude -p <task> --environment <ccpool>`, but it only targets self-hosted environments and it omits `--cloud`. This server keeps `--cloud=` on every create so an older CLI cannot fall through to a local session. A pty has a single output stream, so the CLI's stdout and stderr are both returned in `cli.stdout` (`cli.stderr` is empty on this tool). `cli.stdout` and `cli.stderr` have terminal control sequences removed (cursor save and restore, CSI including private parameters, and other C0 controls) before they are returned.
 
 Input schema:
@@ -205,6 +212,9 @@ Output:
 
 ```json
 {
+  "job_id": "job_5f0c2a9e7b1d43c8a6e2f019",
+  "status": "done",
+  "elapsed_ms": 41230,
   "session_id": "session_01AbC...",
   "session_url": "https://claude.ai/code/session_01AbC...?from=cli&m=0",
   "title": "Fix flaky login test",
@@ -218,7 +228,7 @@ Output:
 }
 ```
 
-`parsed` is `true` when both `session_id` and `session_url` were found in the CLI output. If the output can't be parsed, the call still succeeds with `parsed: false`, the unparsed fields set to `null`, and the cleaned output in `cli`.
+`parsed` is `true` when both `session_id` and `session_url` were found in the CLI output. If the output can't be parsed, the call still succeeds with `parsed: false`, the unparsed fields set to `null`, and the cleaned output in `cli`. While the job is still going, `cli.exit_code` is `null` and `cli.stdout` holds the last 4,000 characters of output so far. For a GitHub repository, `base_branch` is the requested branch, or `null` if none was requested, until the checkout is ready.
 
 ### `claude_send_followup`
 
@@ -260,7 +270,21 @@ Output:
 
 ### `claude_get_session`
 
-Session status for the GitHub artifacts of a cloud session: the branch it pushed, and the pull request URL and number when one exists. Runs, with stdin closed and stdout a pipe:
+`session` takes either a create `job_id` or a cloud session.
+
+**With a job id** (`job_` and 24 hex characters), it reads the job from memory and runs nothing. It returns `job` with the same fields as the [create output](#claude_create_cloud_session): progress while it runs, the final result once `job.status` is `"done"`. Top-level `session_id` mirrors `job.session_id`. The other top-level fields are `null`, `false` or `[]`, and `repo` is ignored. A failed job returns its tool error. An id this server doesn't know, because it expired, was never issued, or belonged to a server that has since exited, returns `JOB_NOT_FOUND`.
+
+```json
+{
+  "job": { "job_id": "job_5f0c2a9e7b1d43c8a6e2f019", "status": "cloning", "elapsed_ms": 18400, "session_id": null, "...": "..." },
+  "session_id": null,
+  "repo": null, "branch": null, "base_branch": null,
+  "pr_number": null, "pr_url": null, "pr_source": null, "pr_error": null,
+  "parsed": false, "args": [], "cli": null
+}
+```
+
+**With a session id or URL**, it reports the GitHub artifacts of a cloud session: the branch it pushed, and the pull request URL and number when one exists. Runs, with stdin closed and stdout a pipe:
 
 `claude --teleport=<session_id> --debug --debug-file=<cache>/sessions/<session_id>.teleport.log`
 
@@ -275,7 +299,7 @@ Input schema:
     "session": {
       "type": "string",
       "maxLength": 2000,
-      "pattern": "^(?:(?:session|cse)_[A-Za-z0-9][A-Za-z0-9_-]*|https:\\/\\/claude\\.ai\\/code\\/[^\\s\"'<>]+)$"
+      "pattern": "(?:^(?:(?:session|cse)_[A-Za-z0-9][A-Za-z0-9_-]*|https:\\/\\/claude\\.ai\\/code\\/[^\\s\"'<>]+)$)|(?:^job_[0-9a-f]{24}$)"
     },
     "repo": { "type": "string", "minLength": 1, "maxLength": 4096 }
   },
@@ -290,6 +314,7 @@ Output:
 
 ```json
 {
+  "job": null,
   "session_id": "session_01AbC...",
   "repo": "owner/name",
   "branch": "claude/add-retry",
@@ -376,6 +401,7 @@ Failures come back as MCP tool errors (`isError: true`). The text content block 
 | `REPO_NOT_ALLOWED` | `repo` is not an absolute directory on `CLAUDE_MCP_REPOS` and not a github.com `owner/name`. The CLI is not started. |
 | `REPO_PREPARE_FAILED` | Preparing the GitHub cache checkout failed (git missing, clone or fetch error, `base_branch` missing on origin, `base_branch` passed for a local directory, lock timeout, or the cache directory has a different `origin`). |
 | `SESSION_REPO_UNKNOWN` | Session status was called without `repo` and this server has no record of a github.com repository for that session. |
+| `JOB_NOT_FOUND` | `claude_get_session` was given a job id this server doesn't hold: it was never issued, it finished more than an hour ago (or was pushed out by newer jobs), or the server restarted. Create the session again, or use the `session_id` from the finished job. |
 
 Schema violations (a missing required field, an unknown property, a value that doesn't match a pattern) are rejected by the MCP SDK's input validation as tool errors, and the CLI is never run.
 
