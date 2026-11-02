@@ -1,7 +1,7 @@
 {
   "name": "@sohampatwardhan/claude-code-mcp-server",
   "version": "0.1.3",
-  "description": "MCP server that lets AI agents (Muse, Grok, and other MCP clients) orchestrate Claude Code cloud sessions via the Claude Code CLI. Requires @anthropic-ai/claude-code installed and signed in (run `claude` once).",
+  "description": "MCP server that lets AI agents (Muse, Grok Bot, ChatGPT Dots, Claude Duet, and other MCP clients) orchestrate Claude Code cloud sessions via the Claude Code CLI. Requires @anthropic-ai/claude-code installed and signed in (run `claude` once).",
   "license": "MIT",
   "author": "Soham Patwardhan",
   "homepage": "https://github.com/sohampatwardhan/claude-code-mcp-server",

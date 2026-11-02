@@ -12,6 +12,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
+import { ISSUE_REPORTING } from "../src/server.js";
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const serverEntry = join(root, "dist/src/index.js");
 const fakeClaude = join(root, "test/fixtures/fake-claude.mjs");
@@ -224,6 +226,11 @@ describe("stdio smoke test", () => {
       assert.match(client.getInstructions() ?? "", /claude_get_session/);
       assert.match(client.getInstructions() ?? "", /npm install -g @anthropic-ai\/claude-code/);
       assert.match(client.getInstructions() ?? "", /job_id/);
+      assert.ok((client.getInstructions() ?? "").includes(ISSUE_REPORTING), "instructions carry the issue-reporting guidance");
+      assert.match(ISSUE_REPORTING, /github\.com\/sohampatwardhan\/claude-code-mcp-server\/issues/);
+      assert.ok(readFileSync(join(root, "README.md"), "utf8").includes(`> ${ISSUE_REPORTING}`), "README block matches ISSUE_REPORTING");
+      const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version: string };
+      assert.equal(client.getServerVersion()?.version, pkg.version);
       assert.match(byName.claude_get_session?.description ?? "", /job id/);
       assert.doesNotMatch(client.getInstructions() ?? "", /no status tool/);
       assert.match(byName.claude_create_cloud_session?.description ?? "", /git format-patch/);
