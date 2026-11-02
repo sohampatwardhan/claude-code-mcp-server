@@ -14,7 +14,7 @@
   },
   "type": "module",
   "bin": {
-    "claude-code-mcp-server": "./dist/src/index.js"
+    "claude-code-mcp-server": "dist/src/index.js"
   },
   "main": "./dist/src/server.js",
   "files": [
