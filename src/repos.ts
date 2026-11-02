@@ -356,6 +356,40 @@ export async function syncCachedCheckout(
   return { branch, cloned };
 }
 
+/** Most `git status` output read for a local run. */
+const MAX_STATUS_CHARS = 1024 * 1024;
+
+/**
+ * `git status` of a local run's directory, as raw `--porcelain=v1 -z` text, or
+ * null when the directory is not a git work tree, git fails, or the output
+ * passes `MAX_STATUS_CHARS`. Read-only:
+ * no optional locks, hooks and fsmonitor off, so the checkout's config can't
+ * make status run a command.
+ */
+export async function readGitStatus(cwd: string, timeoutMs: number): Promise<string | null> {
+  const result = await runCommand(
+    "git",
+    [
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "core.fsmonitor=false",
+      "--no-optional-locks",
+      "status",
+      "--porcelain=v1",
+      "-z",
+      "--untracked-files=all",
+    ],
+    cwd,
+    timeoutMs,
+    { GIT_TERMINAL_PROMPT: "0" },
+    MAX_STATUS_CHARS,
+  );
+  // A status cut off at the cap would drop or split paths; report none rather than a wrong list.
+  if (result.code !== 0 || result.stdout.length >= MAX_STATUS_CHARS) return null;
+  return result.stdout;
+}
+
 /** Branch currently checked out, or null when HEAD is detached or unreadable. */
 export async function readCheckedOutBranch(dest: string, timeoutMs: number): Promise<string | null> {
   const result = await runGit(["symbolic-ref", "--short", "HEAD"], dest, timeoutMs);
@@ -641,6 +675,7 @@ function runCommand(
   cwd: string | undefined,
   timeoutMs: number,
   extraEnv: Record<string, string>,
+  maxOutputChars = 8_000,
 ): Promise<CmdResult> {
   return new Promise((resolvePromise) => {
     let settled = false;
@@ -657,7 +692,7 @@ function runCommand(
     });
     track(child);
     const cap = (buf: { text: string }, chunk: Buffer) => {
-      if (buf.text.length < 8_000) buf.text += chunk.toString("utf8");
+      if (buf.text.length < maxOutputChars) buf.text += chunk.toString("utf8");
     };
     child.stdout.on("data", (chunk: Buffer) => cap(stdout, chunk));
     child.stderr.on("data", (chunk: Buffer) => cap(stderr, chunk));

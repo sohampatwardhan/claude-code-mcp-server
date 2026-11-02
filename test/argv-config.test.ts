@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { authStatusArgv, createSessionArgv, sendFollowupArgv, teleportArgv } from "../src/argv.js";
+import { authStatusArgv, createSessionArgv, localRunArgv, sendFollowupArgv, teleportArgv } from "../src/argv.js";
 import { ConfigError, DEFAULT_TIMEOUT_MS, loadConfig } from "../src/config.js";
 
 // realpath: on macOS tmpdir() is under /var, a symlink to /private/var, and git and
@@ -49,6 +49,68 @@ describe("argv construction", () => {
   });
 });
 
+describe("local run argv", () => {
+  const base = {
+    prompt: "Fix the build",
+    permissionMode: "dontAsk" as const,
+    model: null,
+    maxTurns: null,
+    allowedTools: [],
+    resume: null,
+  };
+
+  it("builds print-mode argv with a fixed flag order and the prompt after --", () => {
+    assert.deepEqual(localRunArgv(base), [
+      "-p",
+      "--output-format=stream-json",
+      "--verbose",
+      "--permission-mode=dontAsk",
+      "--",
+      "Fix the build",
+    ]);
+    assert.deepEqual(
+      localRunArgv({
+        ...base,
+        prompt: "--dangerously-skip-permissions",
+        permissionMode: "acceptEdits",
+        model: "sonnet[1m]",
+        maxTurns: 12,
+        allowedTools: ["Read", "Bash", "Read"],
+        resume: "11111111-2222-4333-8444-555555555555",
+      }),
+      [
+        "-p",
+        "--output-format=stream-json",
+        "--verbose",
+        "--permission-mode=acceptEdits",
+        "--model=sonnet[1m]",
+        "--max-turns=12",
+        "--allowedTools=Read,Bash",
+        "--resume=11111111-2222-4333-8444-555555555555",
+        "--",
+        "--dangerously-skip-permissions",
+      ],
+    );
+  });
+
+  it("refuses bypass, unknown tools, a bad model or resume id, and a bad turn limit", () => {
+    const bad = [
+      { permissionMode: "bypassPermissions" },
+      { permissionMode: "default" },
+      { allowedTools: ["Bash(rm *)"] },
+      { model: "--cloud=x" },
+      { model: "opus extra" },
+      { resume: "session_01ABCDEFGH" },
+      { resume: "--cloud" },
+      { maxTurns: 0 },
+      { maxTurns: 1.5 },
+    ];
+    for (const override of bad) {
+      assert.throws(() => localRunArgv({ ...base, ...override } as Parameters<typeof localRunArgv>[0]), /internal error/, JSON.stringify(override));
+    }
+  });
+});
+
 describe("loadConfig", () => {
   it("uses defaults", () => {
     assert.deepEqual(loadConfig({}), {
@@ -61,6 +123,8 @@ describe("loadConfig", () => {
       cwd: process.cwd(),
       repos: [],
       repoCache: resolve(homedir(), ".claude-mcp", "repos"),
+      localRoots: [],
+      localAllowShell: false,
     });
   });
 
@@ -76,6 +140,8 @@ describe("loadConfig", () => {
         CLAUDE_MCP_CWD: tmp,
         CLAUDE_MCP_REPOS: `${tmp},acme/widgets`,
         CLAUDE_MCP_REPO_CACHE: join(tmp, "repo-cache"),
+        CLAUDE_MCP_LOCAL_ROOTS: ` ${tmp} , ${tmp}/ `,
+        CLAUDE_MCP_LOCAL_ALLOW_SHELL: "1",
       }),
       {
         claudeBin: "/opt/claude",
@@ -90,6 +156,8 @@ describe("loadConfig", () => {
           { kind: "github", slug: "acme/widgets", owner: "acme", name: "widgets" },
         ],
         repoCache: resolve(tmp, "repo-cache"),
+        localRoots: [realpathSync(tmp)],
+        localAllowShell: true,
       },
     );
   });
@@ -125,6 +193,14 @@ describe("loadConfig", () => {
     const file = join(tmp, "cache-file");
     writeFileSync(file, "x");
     assert.throws(() => loadConfig({ CLAUDE_MCP_REPO_CACHE: file }), ConfigError);
+  });
+
+  it("rejects a relative, missing, file, or filesystem-root CLAUDE_MCP_LOCAL_ROOTS entry", () => {
+    const file = join(tmp, "a-file");
+    writeFileSync(file, "x");
+    for (const raw of ["relative/dir", join(tmp, "missing"), file, "/"]) {
+      assert.throws(() => loadConfig({ CLAUDE_MCP_LOCAL_ROOTS: raw }), ConfigError, raw);
+    }
   });
 
   it("treats an explicit false trust flag as off", () => {

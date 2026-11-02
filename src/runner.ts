@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 import { KILL_GRACE_MS, killGroup, track } from "./children.js";
 import { cliNotFoundMessage } from "./prereq.js";
@@ -27,16 +28,26 @@ export class RunError extends Error {
   }
 }
 
-export type Runner = (bin: string, args: string[], timeoutMs: number, cwd: string) => Promise<RunResult>;
+/** Called with stdout as it arrives, decoded as UTF-8, whether or not it fits under the capture cap. */
+export type StdoutListener = (text: string) => void;
+
+export type Runner = (
+  bin: string,
+  args: string[],
+  timeoutMs: number,
+  cwd: string,
+  onStdout?: StdoutListener,
+) => Promise<RunResult>;
 
 /**
  * Spawns `bin` with an argv array (never a shell), stdin closed, and a hard
  * timeout. The child leads its own process group and is tracked so a cancel
- * or shutdown can stop it. `cwd` is the directory the CLI runs in. Resolves with the outcome
+ * or shutdown can stop it. `cwd` is the directory the CLI runs in. `onStdout` sees
+ * stdout as it arrives. Resolves with the outcome
  * for any process that started; rejects with RunError only when the process
  * could not be started.
  */
-export const runCli: Runner = (bin, args, timeoutMs, cwd) =>
+export const runCli: Runner = (bin, args, timeoutMs, cwd, onStdout) =>
   new Promise((resolve, reject) => {
     const started = Date.now();
     const child = spawn(bin, args, {
@@ -51,7 +62,15 @@ export const runCli: Runner = (bin, args, timeoutMs, cwd) =>
 
     const stdout = collector();
     const stderr = collector();
-    child.stdout.on("data", stdout.push);
+    const decoder = new StringDecoder("utf8");
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout.push(chunk);
+      onStdout?.(decoder.write(chunk));
+    });
+    child.stdout.once("end", () => {
+      const rest = decoder.end();
+      if (rest !== "") onStdout?.(rest);
+    });
     child.stderr.on("data", stderr.push);
 
     let timedOut = false;

@@ -5,20 +5,33 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-import { authStatusArgv, createSessionArgv, sendFollowupArgv, teleportArgv } from "./argv.js";
+import {
+  LOCAL_ALLOWED_TOOLS,
+  LOCAL_PERMISSION_MODES,
+  LOCAL_SESSION_ID_PATTERN,
+  MODEL_PATTERN,
+  authStatusArgv,
+  createSessionArgv,
+  localRunArgv,
+  sendFollowupArgv,
+  teleportArgv,
+} from "./argv.js";
 import { KILL_GRACE_MS, Scope, abortOnSignal, runInScope } from "./children.js";
 import { ENVIRONMENT_ID_PATTERN, type Config } from "./config.js";
 import { JOB_ID_PATTERN, JobStore, settleWithin, type Job, type JobStatus } from "./jobs.js";
+import { LOCAL_CWD_PATTERN, LocalPathError, resolveLocalCwd } from "./local.js";
 import { cliNotFoundMessage, isSignInError, signInMessage } from "./prereq.js";
 import { normalizePtyText, runCliPty, type PtyRunResult } from "./pty.js";
 import {
   AuthParseError,
+  LocalStreamParser,
   SESSION_REF_PATTERN,
   cleanTerminalText,
   findSessionId,
   parseAuthStatus,
   parseCreateOutput,
   parseFollowupOutput,
+  parseGitStatusZ,
   parseTeleportOutput,
   type ParsedCreate,
 } from "./parse.js";
@@ -35,6 +48,7 @@ import {
   lookupPullRequest,
   parseGithubRepoArg,
   readCheckedOutBranch,
+  readGitStatus,
   readSessionRecord,
   teleportDebugPath,
   withPreparedGithubRepo,
@@ -49,7 +63,7 @@ export const SERVER_VERSION = "0.1.1";
 
 /** Server-level guidance sent to clients in the initialize result. */
 export const SERVER_INSTRUCTIONS =
-  "Starts and drives Claude Code cloud sessions. Requires the Claude Code CLI on this machine, installed with " +
+  "Starts and drives Claude Code cloud sessions, and, when CLAUDE_MCP_LOCAL_ROOTS is set, local headless runs. Requires the Claude Code CLI on this machine, installed with " +
   "`npm install -g @anthropic-ai/claude-code` and signed in by running `claude` once (claude_auth_status checks " +
   "this). CLI_NOT_FOUND and CLI_NOT_SIGNED_IN errors say which step is missing.\n\n" +
   "claude_create_cloud_session returns within a few seconds. When its status is not `done`, the session is " +
@@ -57,6 +71,9 @@ export const SERVER_INSTRUCTIONS =
   "until job.status is `done` (session_id and session_url are then set) or the call returns an error. Job ids " +
   "are kept in this server's memory only. claude_cancel_session stops a job that is stuck; it stops only " +
   "processes on this machine, and a cloud session that was already created keeps running.\n\n" +
+  "claude_run_local runs Claude Code on this machine in a checkout under CLAUDE_MCP_LOCAL_ROOTS, for work " +
+  "that needs the local toolchain. It also returns a job_id: poll claude_get_session until local_job.status " +
+  "is `done`, then read result, files and session_id; pass that session_id as `resume` to continue.\n\n" +
   "Check results with claude_get_session, which reports the " +
   "branch a session pushed and any pull request it opened; the conversation and replies are only visible at " +
   "the session's session_url.\n\n" +
@@ -78,6 +95,8 @@ const CREATE_WAIT_MS = 2_000;
 const OUTPUT_TAIL_CHARS = 4_000;
 /** Raw CLI output kept per job, to bound memory. Mirrors the pty cap. */
 const MAX_JOB_OUTPUT_CHARS = 4 * 1024 * 1024;
+/** Changed files a local run reports. */
+const MAX_LOCAL_FILES = 1_000;
 
 /** `session` for claude_get_session: a session ref or a create job id. */
 const SESSION_OR_JOB_PATTERN = new RegExp(`(?:${SESSION_REF_PATTERN.source})|(?:${JOB_ID_PATTERN.source})`);
@@ -87,6 +106,7 @@ export const TOOL_NAMES = [
   "claude_send_followup",
   "claude_get_session",
   "claude_cancel_session",
+  "claude_run_local",
   "claude_auth_status",
 ] as const;
 
@@ -102,7 +122,9 @@ export type ErrorCode =
   | "REPO_PREPARE_FAILED"
   | "SESSION_REPO_UNKNOWN"
   | "CLI_NOT_SIGNED_IN"
-  | "JOB_NOT_FOUND";
+  | "JOB_NOT_FOUND"
+  | "LOCAL_RUNS_DISABLED"
+  | "LOCAL_SHELL_DISABLED";
 
 // ---- schemas -------------------------------------------------------------
 
@@ -200,8 +222,53 @@ const cancelInput = z
       .max(2_000)
       .regex(SESSION_OR_JOB_PATTERN)
       .describe(
-        "Create job to stop: its job id (job_...), or the session id (session_... / cse_...) or https://claude.ai/code/... URL an unfinished job printed.",
+        "Job to stop: a job id (job_...) from claude_create_cloud_session or claude_run_local, or the session id (session_... / cse_...) or https://claude.ai/code/... URL an unfinished create job printed.",
       ),
+  })
+  .strict();
+
+const localInput = z
+  .object({
+    cwd: z
+      .string()
+      .min(1)
+      .max(4_096)
+      .regex(LOCAL_CWD_PATTERN)
+      .describe(
+        "Absolute directory to run in: an existing checkout inside a CLAUDE_MCP_LOCAL_ROOTS directory. Compared after resolving symlinks.",
+      ),
+    prompt: text("prompt").describe("Task for Claude Code."),
+    resume: z
+      .string()
+      .regex(LOCAL_SESSION_ID_PATTERN)
+      .optional()
+      .describe("session_id of an earlier local run to continue (claude --resume). Omit to start a new session."),
+    model: z
+      .string()
+      .regex(MODEL_PATTERN)
+      .optional()
+      .describe("Model alias (opus, sonnet, haiku, fable) or full model name. Omit for the CLI's default."),
+    permission_mode: z
+      .enum(LOCAL_PERMISSION_MODES)
+      .optional()
+      .describe(
+        "dontAsk (default): only reads and allowed_tools run; anything that would prompt is denied. acceptEdits: also file edits and common filesystem commands in cwd. plan: read-only exploration. auto: a background classifier reviews each action, including shell commands; needs CLAUDE_MCP_LOCAL_ALLOW_SHELL. Permission bypass is not available.",
+      ),
+    allowed_tools: z
+      .array(z.enum(LOCAL_ALLOWED_TOOLS))
+      .max(LOCAL_ALLOWED_TOOLS.length)
+      .optional()
+      .describe(
+        "Built-in tools that run without asking (--allowedTools). Bash allows every shell command and needs CLAUDE_MCP_LOCAL_ALLOW_SHELL.",
+      ),
+    max_turns: z.number().int().min(1).max(1_000).optional().describe("Stop after this many agentic turns."),
+    timeout_s: z
+      .number()
+      .int()
+      .min(1)
+      .max(86_400)
+      .optional()
+      .describe("Time limit for the run, in seconds. Omit to use CLAUDE_MCP_TIMEOUT_MS."),
   })
   .strict();
 
@@ -259,11 +326,69 @@ const createOutput = z
   })
   .strict();
 
+const localOutput = z
+  .object({
+    job_id: z.string().describe("Background job for this run. Pass it to claude_get_session until status is done."),
+    status: z
+      .enum(["starting", "running", "done", "cancelled"])
+      .describe(
+        "starting: claude -p is running and has not reported a session yet. running: session_id is known and the CLI has not exited. done: the CLI exited and the result below is final. cancelled: claude_cancel_session stopped the run.",
+      ),
+    elapsed_ms: z.number().int().describe("Time since the run started, or its total duration once done."),
+    session_id: z.string().nullable().describe("Local session id. Pass it as `resume` to continue this session."),
+    cwd: z.string().describe("Directory the CLI ran in, after resolving symlinks."),
+    permission_mode: z.enum(LOCAL_PERMISSION_MODES),
+    assistant_messages: z.number().int().describe("Assistant messages seen so far."),
+    parsed: z.boolean().describe("True when the CLI's final result line was read."),
+    subtype: z.string().nullable().describe("Result subtype, such as success or error_max_turns."),
+    is_error: z.boolean().nullable().describe("True when the run ended in an error state (max turns, an API error, a refusal)."),
+    result: z.string().nullable().describe("Text of the final assistant message."),
+    num_turns: z.number().int().nullable(),
+    total_cost_usd: z.number().nullable(),
+    usage: z
+      .object({
+        input_tokens: z.number().int().nullable(),
+        output_tokens: z.number().int().nullable(),
+        cache_creation_input_tokens: z.number().int().nullable(),
+        cache_read_input_tokens: z.number().int().nullable(),
+      })
+      .strict()
+      .nullable(),
+    permission_denials: z.array(z.string()).describe("Tools whose calls were denied, by name."),
+    errors: z.array(z.string()).describe("Errors the CLI reported on an error result."),
+    files: z
+      .array(
+        z
+          .object({
+            path: z.string(),
+            status: z
+              .string()
+              .nullable()
+              .describe("git status --porcelain code after the run (` M`, `A `, `??`, ...), or null when the path was listed before the run and is clean now."),
+            from: z.string().nullable().describe("Previous path of a rename or copy."),
+            before: z.string().nullable().describe("The path's status code before the run, or null when it was clean."),
+          })
+          .strict(),
+      )
+      .nullable()
+      .describe(
+        "Paths git status lists after the run, plus paths that were listed before and are clean now. Changes Claude committed don't appear. Null until done, and when cwd is not a git work tree.",
+      ),
+    args: z.array(z.string()),
+    cli: cliOutput.describe(
+      "exit_code, and the tail of stderr. stdout is empty when the result line was read (it is the session transcript), otherwise its last 4,000 characters.",
+    ),
+  })
+  .strict();
+
 const sessionOutput = z
   .object({
     job: createOutput
       .nullable()
-      .describe("Set when `session` was a job id: that create's progress or result. The other fields are then null, false or empty."),
+      .describe("Set when `session` was a create job id: that create's progress or result. The other fields are then null, false or empty."),
+    local_job: localOutput
+      .nullable()
+      .describe("Set when `session` was a claude_run_local job id: that run's progress or result. The other fields are then null, false or empty."),
     session_id: z.string().nullable(),
     repo: z.string().nullable().describe("github.com owner/name the status read used."),
     branch: z.string().nullable().describe("Branch the cloud session pushed, or null when none is checked out yet."),
@@ -280,7 +405,8 @@ const sessionOutput = z
 
 const cancelOutput = z
   .object({
-    job: createOutput.describe("The job after this call."),
+    job: createOutput.nullable().describe("The create job after this call, or null for a local run."),
+    local_job: localOutput.nullable().describe("The claude_run_local job after this call, or null for a create job."),
     cancelled: z
       .boolean()
       .describe("True when this call cancelled the job. False when it had already finished or been cancelled."),
@@ -289,6 +415,18 @@ const cancelOutput = z
   .strict();
 
 type CreateBody = z.infer<typeof createOutput>;
+type LocalBody = z.infer<typeof localOutput>;
+
+/** Fixed fields of one claude_run_local job. */
+interface LocalJob {
+  args: string[];
+  cwd: string;
+  permissionMode: LocalBody["permission_mode"];
+  timeoutMs: number;
+  scope: Scope;
+  /** Reads the stream-json as it arrives; the transcript itself is not kept. */
+  parser: LocalStreamParser;
+}
 
 /** Fixed fields of one create job. `cwd`, `baseBranch` and `cache` are updated once the cache checkout is ready. */
 interface CreateJob {
@@ -332,6 +470,7 @@ const authOutput = z
 export function createServer(config: Config, runner: Runner = runCli): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: SERVER_INSTRUCTIONS });
   const jobs = new JobStore<CreateJob>();
+  const localJobs = new JobStore<LocalJob>();
 
   /** Runs the CLI; returns the result on exit 0, otherwise a tool error. */
   async function run(args: string[]): Promise<RunResult | CallToolResult> {
@@ -589,11 +728,18 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
   /** claude_get_session for a job id: progress, the final result, or the job's tool error. */
   function readJob(id: string): CallToolResult {
     const job = jobs.get(id);
-    if (job === null) return jobNotFound(id);
+    if (job === null) {
+      const local = localJobs.get(id);
+      if (local === null) return jobNotFound(id);
+      const body = localJobBody(local);
+      if (!isLocalBody(body)) return body;
+      return ok({ ...emptySession(), local_job: body, session_id: body.session_id });
+    }
     const body = jobBody(job);
     if (!isCreateBody(body)) return body;
     return ok({
       job: body,
+      local_job: null,
       session_id: body.session_id,
       repo: null,
       branch: null,
@@ -639,7 +785,8 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       description:
         "With a job id from claude_create_cloud_session, report that create's progress in `job` (status, " +
         "elapsed time, the tail of the CLI output, and session_id once the CLI prints it), its final result once " +
-        "`job.status` is `done`, or its error; this reads memory only and runs nothing. " +
+        "`job.status` is `done`, or its error. With a job id from claude_run_local, report that run in " +
+        "`local_job` the same way. A job read uses memory only and runs nothing. " +
         "With a session id or URL, report the branch a cloud session pushed and any pull request it opened. Prepares the github.com " +
         "checkout in CLAUDE_MCP_REPO_CACHE (origin set to that repository), then runs print-mode " +
         "`claude --teleport=<session> --debug` there and stops when the CLI exits. Print mode checks out " +
@@ -759,6 +906,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     const stderr = [cleanTerminalText(result.stderr).trim(), ...parsed.notes].filter((line) => line !== "").join("\n");
     return ok({
       job: null,
+      local_job: null,
       session_id: sessionId,
       repo: github.slug,
       branch,
@@ -776,11 +924,11 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
   server.registerTool(
     "claude_cancel_session",
     {
-      title: "Cancel a create job",
+      title: "Cancel a create job or local run",
       description:
-        "Stop a claude_create_cloud_session job that is still running: every process it started on this machine " +
-        "(git, the pty helper and claude --cloud) gets SIGTERM, then SIGKILL 5 s later. Pass the job_id, or the " +
-        "session id or URL an unfinished job already printed. Waits up to about 6 s for the processes to exit and " +
+        "Stop a claude_create_cloud_session job or claude_run_local job that is still running: every process it " +
+        "started on this machine (git, the pty helper, claude --cloud or claude -p) gets SIGTERM, then SIGKILL 5 s " +
+        "later. Pass the job_id, or for a create job the session id or URL it already printed. Waits up to about 6 s for the processes to exit and " +
         "reports `stopped`. This does not stop a cloud session: one the CLI already created keeps running at its " +
         "session_url. A job that already finished is left as it is (`cancelled` false), and one that failed " +
         "returns its error.",
@@ -792,6 +940,8 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       let job: Job<CreateJob> | null;
       if (JOB_ID_PATTERN.test(session)) {
         job = jobs.get(session);
+        const local = job === null ? localJobs.get(session) : null;
+        if (local !== null) return cancelLocal(local);
         if (job === null) return jobNotFound(session);
       } else {
         const sessionId = sessionIdOf(session);
@@ -808,16 +958,189 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       if (job.status !== "cancelled") {
         const body = jobBody(job);
         if (!isCreateBody(body)) return body;
-        return ok({ job: body, cancelled: false, stopped: job.details.scope.idle });
+        return ok({ job: body, local_job: null, cancelled: false, stopped: job.details.scope.idle });
       }
       await settleWithin(job, KILL_GRACE_MS + 1_000);
       return ok({
         job: pendingBody(job),
+        local_job: null,
         cancelled,
         stopped: job.finishedAt !== null && job.details.scope.idle,
       });
     },
   );
+
+  async function cancelLocal(job: Job<LocalJob>): Promise<CallToolResult> {
+    const cancelled = cancelLocalJob(job);
+    if (job.status !== "cancelled") {
+      const body = localJobBody(job);
+      if (!isLocalBody(body)) return body;
+      return ok({ job: null, local_job: body, cancelled: false, stopped: job.details.scope.idle });
+    }
+    await settleWithin(job, KILL_GRACE_MS + 1_000);
+    const body = localJobBody(job);
+    return ok({
+      job: null,
+      local_job: isLocalBody(body) ? body : null,
+      cancelled,
+      stopped: job.finishedAt !== null && job.details.scope.idle,
+    });
+  }
+
+  server.registerTool(
+    "claude_run_local",
+    {
+      title: "Run Claude Code locally",
+      description:
+        "Run Claude Code headless on this machine (`claude -p`) in an existing checkout, instead of a cloud " +
+        "session: for work that needs the local toolchain or hardware. `cwd` must be inside a " +
+        "CLAUDE_MCP_LOCAL_ROOTS directory after resolving symlinks; with no roots configured every call fails " +
+        "with LOCAL_RUNS_DISABLED. Print mode does not show the workspace-trust dialog, so the checkout's " +
+        "hooks, settings and allow rules apply. The run is a background job and this call returns within a few " +
+        "seconds: if `status` is not `done`, poll claude_get_session with `job_id` until `local_job.status` is " +
+        "`done` or the call returns an error. The final result has the session_id (pass it as `resume` to " +
+        "continue), the result text, turns, cost and usage, denied tools, and the files git status lists. " +
+        "permission_mode defaults to dontAsk, which denies anything not read-only or in allowed_tools; " +
+        "permission bypass is never used. Pre-approving Bash or using auto mode runs shell commands unasked and " +
+        "fails with LOCAL_SHELL_DISABLED unless CLAUDE_MCP_LOCAL_ALLOW_SHELL is set. claude_cancel_session stops a run.",
+      inputSchema: localInput,
+      outputSchema: localOutput,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ cwd, prompt, resume, model, permission_mode, allowed_tools, max_turns, timeout_s }, extra) => {
+      if (config.localRoots.length === 0) {
+        return toolError(
+          "LOCAL_RUNS_DISABLED",
+          "claude_run_local is off: CLAUDE_MCP_LOCAL_ROOTS lists no directories. Set it to the absolute directories local runs may use. Print mode skips the workspace-trust dialog, so every checkout under a listed root is trusted.",
+          [],
+        );
+      }
+      if (!config.localAllowShell && (permission_mode === "auto" || allowed_tools?.includes("Bash") === true)) {
+        return toolError(
+          "LOCAL_SHELL_DISABLED",
+          "allowed_tools Bash and permission_mode auto let a local run execute shell commands without asking, and are off. Set CLAUDE_MCP_LOCAL_ALLOW_SHELL=1 to allow them. Without it, use dontAsk, acceptEdits or plan.",
+          [],
+        );
+      }
+      let realCwd: string;
+      try {
+        realCwd = resolveLocalCwd(cwd, config.localRoots);
+      } catch (err) {
+        if (err instanceof LocalPathError) return toolError("REPO_NOT_ALLOWED", err.message, []);
+        throw err;
+      }
+      const permissionMode = permission_mode ?? "dontAsk";
+      const details: LocalJob = {
+        args: localRunArgv({
+          prompt,
+          permissionMode,
+          model: model ?? null,
+          maxTurns: max_turns ?? null,
+          allowedTools: allowed_tools ?? [],
+          resume: resume ?? null,
+        }),
+        cwd: realCwd,
+        permissionMode,
+        timeoutMs: timeout_s === undefined ? config.timeoutMs : timeout_s * 1_000,
+        scope: new Scope(),
+        parser: new LocalStreamParser(),
+      };
+      const job = localJobs.start(details, "starting", (started) =>
+        runInScope(started.details.scope, () => runLocalJob(started)),
+      );
+      // A caller that cancels this request never learns the job id, so the job goes with it.
+      const onAbort = () => cancelLocalJob(job);
+      extra.signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        await settleWithin(job, CREATE_WAIT_MS);
+      } finally {
+        extra.signal.removeEventListener("abort", onAbort);
+      }
+      const body = localJobBody(job);
+      return isLocalBody(body) ? ok(body) : body;
+    },
+  );
+
+  /** Run `claude -p` and read its result. Settles with the final tool result. */
+  async function runLocalJob(job: Job<LocalJob>): Promise<CallToolResult> {
+    const { args, cwd, timeoutMs, parser } = job.details;
+    const before = await readGitStatus(cwd, timeoutMs);
+    let result: RunResult;
+    try {
+      result = await runner(config.claudeBin, args, timeoutMs, cwd, (text) => {
+        parser.push(text);
+        if (parser.sessionId !== null) localJobs.advance(job, "running");
+      });
+    } catch (err) {
+      if (err instanceof RunError) return toolError(err.code, err.message, args);
+      throw err;
+    }
+    parser.end();
+    const shown = localResultForError(result, parser);
+    if (result.timedOut) {
+      const resume = parser.sessionId === null ? "" : ` Session ${parser.sessionId} can be continued with resume.`;
+      return toolError("CLI_TIMEOUT", `claude timed out after ${timeoutMs} ms.${resume}`, args, shown);
+    }
+    const final = parser.result;
+    if (final === null && result.exitCode !== 0) return exitError(shown, args);
+    if (final !== null && final.is_error) {
+      const detail = [final.result ?? "", ...final.errors].join("\n").trim();
+      if (isSignInError(detail)) return toolError("CLI_NOT_SIGNED_IN", signInMessage(detail), args, shown);
+    }
+    const after = await readGitStatus(cwd, timeoutMs);
+    return ok(localBody(job, "done", changedFiles(before, after), {
+      exit_code: result.exitCode,
+      stdout: final === null ? tail(cleanTerminalText(result.stdout)) : "",
+      stderr: tail(cleanTerminalText(result.stderr)),
+    }));
+  }
+
+  function cancelLocalJob(job: Job<LocalJob>): boolean {
+    if (!localJobs.cancel(job)) return false;
+    job.details.scope.abort();
+    return true;
+  }
+
+  function localBody(
+    job: Job<LocalJob>,
+    status: LocalBody["status"],
+    files: LocalBody["files"],
+    output: LocalBody["cli"],
+  ): LocalBody {
+    const { args, cwd, permissionMode, parser } = job.details;
+    const final = parser.result;
+    return {
+      job_id: job.id,
+      status,
+      elapsed_ms: localJobs.elapsedMs(job),
+      session_id: parser.sessionId,
+      cwd,
+      permission_mode: permissionMode,
+      assistant_messages: parser.assistantMessages,
+      parsed: final !== null,
+      subtype: final?.subtype ?? null,
+      is_error: final?.is_error ?? null,
+      result: final?.result ?? null,
+      num_turns: final?.num_turns ?? null,
+      total_cost_usd: final?.total_cost_usd ?? null,
+      usage: final?.usage ?? null,
+      permission_denials: final?.permission_denials ?? [],
+      errors: final?.errors ?? [],
+      files,
+      args,
+      cli: output,
+    };
+  }
+
+  /** What a local job reports now: progress, its final body, or its tool error. */
+  function localJobBody(job: Job<LocalJob>): LocalBody | CallToolResult {
+    if (job.status !== "cancelled") {
+      if (job.failure !== null) throw job.failure.error;
+      if (job.result !== null) return job.result.isError === true ? job.result : (job.result.structuredContent as LocalBody);
+    }
+    const status = job.status === "cancelled" ? "cancelled" : job.status === "running" ? "running" : "starting";
+    return localBody(job, status, null, { exit_code: null, stdout: "", stderr: "" });
+  }
 
   server.registerTool(
     "claude_auth_status",
@@ -864,6 +1187,58 @@ async function inRequestScope<T>(signal: AbortSignal, fn: () => Promise<T>): Pro
 
 function isCreateBody(value: CreateBody | CallToolResult): value is CreateBody {
   return "job_id" in value;
+}
+
+function isLocalBody(value: LocalBody | CallToolResult): value is LocalBody {
+  return "job_id" in value;
+}
+
+/** claude_get_session fields that don't apply to a job read. */
+function emptySession() {
+  return {
+    job: null,
+    local_job: null,
+    session_id: null,
+    repo: null,
+    branch: null,
+    base_branch: null,
+    pr_number: null,
+    pr_url: null,
+    pr_source: null,
+    pr_error: null,
+    parsed: false,
+    args: [],
+    cli: null,
+  };
+}
+
+function tail(text: string): string {
+  return text.length > OUTPUT_TAIL_CHARS ? text.slice(-OUTPUT_TAIL_CHARS) : text;
+}
+
+/**
+ * The run's output as an error reports it: the tail of stdout only when no
+ * result line was read (stdout is the session transcript otherwise).
+ */
+function localResultForError(result: RunResult, parser: LocalStreamParser): RunResult {
+  return { ...result, stdout: parser.result === null ? tail(result.stdout) : "", stderr: tail(result.stderr) };
+}
+
+/** Files git status lists after a local run, with each path's status before it. */
+function changedFiles(before: string | null, after: string | null): LocalBody["files"] {
+  if (after === null) return null;
+  const prior = new Map(parseGitStatusZ(before ?? "").map((entry) => [entry.path, entry.status]));
+  const files: NonNullable<LocalBody["files"]> = parseGitStatusZ(after).map((entry) => ({
+    path: entry.path,
+    status: entry.status,
+    from: entry.from,
+    before: prior.get(entry.path) ?? null,
+  }));
+  const listed = new Set(files.map((file) => file.path));
+  for (const [path, status] of prior) {
+    if (!listed.has(path)) files.push({ path, status: null, from: null, before: status });
+  }
+  return files.slice(0, MAX_LOCAL_FILES);
 }
 
 // ---- result helpers ------------------------------------------------------

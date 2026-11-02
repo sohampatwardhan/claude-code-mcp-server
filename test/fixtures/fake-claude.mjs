@@ -25,6 +25,12 @@
 //                          line when FAKE_TELEPORT_PR_NUMBER and FAKE_TELEPORT_PR_URL are set
 //   FAKE_TELEPORT_BRANCH   branch name to check out (default claude/session-branch)
 //   FAKE_TELEPORT_ERROR    stderr and debug text for fail mode
+//   FAKE_LOCAL_MODE        local print-mode run (`-p` first): unset prints init, an
+//                          assistant message and a success result; "max_turns" ends
+//                          with an error_max_turns result and exits 1; "hang" prints
+//                          init and never exits; "no_result" exits 1 with stderr only
+//   FAKE_LOCAL_DELAY_MS    a local run waits this long before its result
+//   FAKE_LOCAL_WRITE       a local run writes this file (relative to cwd) before its result
 //
 // Creating a session (`--cloud=<description>` without `-p`) requires a TTY,
 // matching Claude Code: a piped stdout exits 3 with the interactive-terminal error.
@@ -118,6 +124,8 @@ if (mode === "hang") {
   }
 } else if (args[0]?.startsWith("--teleport=")) {
   handleTeleport(args[0].slice("--teleport=".length));
+} else if (args[0] === "-p" && args.includes("--output-format=stream-json")) {
+  handleLocal();
 } else {
   process.stderr.write(`fake-claude: unexpected argv ${JSON.stringify(args)}\n`);
   process.exit(64);
@@ -205,4 +213,60 @@ function fileTrusted() {
     if (projects[key]?.hasTrustDialogAccepted === true) return true;
   }
   return false;
+}
+
+function handleLocal() {
+  const localMode = process.env.FAKE_LOCAL_MODE ?? "ok";
+  const resume = args.find((arg) => arg.startsWith("--resume="));
+  const session = resume === undefined ? "11111111-2222-4333-8444-555555555555" : resume.slice("--resume=".length);
+  const prompt = args[args.indexOf("--") + 1] ?? "";
+  const emit = (value, done) => process.stdout.write(JSON.stringify(value) + "\n", done);
+  if (localMode === "no_result") {
+    process.stderr.write("Error: something went wrong before the session started\n");
+    process.exit(1);
+  }
+  emit({ type: "system", subtype: "init", session_id: session, cwd: process.cwd(), tools: ["Read", "Edit", "Bash"] });
+  if (localMode === "hang") {
+    setInterval(() => {}, 1_000);
+    return;
+  }
+  emit({
+    type: "assistant",
+    session_id: session,
+    message: { role: "assistant", content: [{ type: "text", text: "Working on it." }] },
+  });
+  setTimeout(() => {
+    if (process.env.FAKE_LOCAL_WRITE) writeFileSync(join(process.cwd(), process.env.FAKE_LOCAL_WRITE), `${prompt}\n`);
+    const usage = { input_tokens: 120, output_tokens: 45, cache_creation_input_tokens: 0, cache_read_input_tokens: 800 };
+    if (localMode === "max_turns") {
+      emit({
+        type: "result",
+        subtype: "error_max_turns",
+        is_error: true,
+        num_turns: 3,
+        total_cost_usd: 0.02,
+        usage,
+        permission_denials: [],
+        errors: ["Reached maximum number of turns (3)"],
+        session_id: session,
+      }, () => process.exit(1));
+      return;
+    }
+    // A partial line split across writes, as a pipe can deliver it.
+    const line = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: `Done: ${prompt}`,
+      num_turns: 2,
+      total_cost_usd: 0.0123,
+      usage,
+      permission_denials: [{ tool_name: "Bash", tool_use_id: "toolu_01", tool_input: { command: "rm -rf build" } }],
+      session_id: session,
+    });
+    process.stdout.write(line.slice(0, 20));
+    setTimeout(() => {
+      process.stdout.write(line.slice(20) + "\n", () => process.exit(0));
+    }, 20);
+  }, Number(process.env.FAKE_LOCAL_DELAY_MS ?? "0"));
 }

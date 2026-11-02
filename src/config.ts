@@ -7,6 +7,7 @@
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { LocalRootError, parseLocalRoots } from "./local.js";
 import { defaultRepoCache, parseAllowlist, type AllowEntry } from "./repos.js";
 
 export const DEFAULT_TIMEOUT_MS = 300_000;
@@ -44,6 +45,16 @@ export interface Config {
   repos: AllowEntry[];
   /** Directory that holds checkouts of GitHub repositories named by a call. */
   repoCache: string;
+  /**
+   * Real paths of the directories `claude_run_local` may run in (and their
+   * subdirectories). Empty by default, which refuses every local run.
+   */
+  localRoots: string[];
+  /**
+   * When true, a local run may pre-approve `Bash` or use `auto` mode, either
+   * of which runs shell commands without asking. Off by default.
+   */
+  localAllowShell: boolean;
 }
 
 export class ConfigError extends Error {
@@ -64,6 +75,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const idleTimeoutMs = parseMilliseconds("CLAUDE_MCP_IDLE_TIMEOUT_MS", env.CLAUDE_MCP_IDLE_TIMEOUT_MS);
 
   const trustCwd = parseBooleanFlag("CLAUDE_MCP_TRUST_CWD", env.CLAUDE_MCP_TRUST_CWD);
+  const localAllowShell = parseBooleanFlag("CLAUDE_MCP_LOCAL_ALLOW_SHELL", env.CLAUDE_MCP_LOCAL_ALLOW_SHELL);
   const pythonBin = (env.CLAUDE_MCP_PYTHON ?? "").trim() || "python3";
   const cwd = resolveCwd(env.CLAUDE_MCP_CWD);
   let repos: AllowEntry[];
@@ -73,6 +85,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new ConfigError(err instanceof Error ? err.message : String(err));
   }
   const repoCache = resolveRepoCache(env.CLAUDE_MCP_REPO_CACHE);
+  let localRoots: string[];
+  try {
+    localRoots = parseLocalRoots(env.CLAUDE_MCP_LOCAL_ROOTS);
+  } catch (err) {
+    if (err instanceof LocalRootError) throw new ConfigError(err.message);
+    throw err;
+  }
 
   return {
     claudeBin,
@@ -84,6 +103,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     cwd,
     repos,
     repoCache,
+    localRoots,
+    localAllowShell,
   };
 }
 

@@ -180,6 +180,24 @@ function alive(pid: number): boolean {
   }
 }
 
+/** Poll claude_get_session for a claude_run_local job until `done` holds or the call errors. */
+async function pollLocal(
+  client: Connected["client"],
+  jobId: string,
+  done: (job: Record<string, unknown>) => boolean,
+  timeoutMs = 15_000,
+): Promise<CallToolResult> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const result = (await client.callTool({ name: "claude_get_session", arguments: { session: jobId } })) as CallToolResult;
+    if (result.isError === true) return result;
+    const job = (result.structuredContent as { local_job: Record<string, unknown> }).local_job;
+    if (done(job)) return result;
+    assert.ok(Date.now() < deadline, `local job ${jobId} did not reach the expected state; last ${JSON.stringify(job)}`);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+  }
+}
+
 async function waitFor(check: () => boolean, ms: number, what: string): Promise<void> {
   const deadline = Date.now() + ms;
   while (!check()) {
@@ -196,7 +214,7 @@ function errorBody(result: CallToolResult): { error: { code: string; message: st
 }
 
 describe("stdio smoke test", () => {
-  it("lists exactly the five tools, each with a strict input schema", async () => {
+  it("lists exactly the six tools, each with a strict input schema", async () => {
     const { client, close } = await connect();
     try {
       const { tools } = await client.listTools();
@@ -205,6 +223,7 @@ describe("stdio smoke test", () => {
         "claude_cancel_session",
         "claude_create_cloud_session",
         "claude_get_session",
+        "claude_run_local",
         "claude_send_followup",
       ]);
       for (const tool of tools) {
@@ -219,6 +238,9 @@ describe("stdio smoke test", () => {
       assert.match(byName.claude_cancel_session?.description ?? "", /does not stop a cloud session/);
       assert.deepEqual(byName.claude_send_followup?.inputSchema.required?.slice().sort(), ["message", "session"]);
       assert.deepEqual(byName.claude_auth_status?.inputSchema.properties, {});
+      assert.deepEqual(byName.claude_run_local?.inputSchema.required?.slice().sort(), ["cwd", "prompt"]);
+      assert.match(byName.claude_run_local?.description ?? "", /LOCAL_RUNS_DISABLED/);
+      assert.match(client.getInstructions() ?? "", /claude_run_local/);
       assert.match(client.getInstructions() ?? "", /can't push its branch to GitHub/);
       assert.match(client.getInstructions() ?? "", /git format-patch/);
       assert.match(client.getInstructions() ?? "", /claude_get_session/);
@@ -374,6 +396,16 @@ describe("stdio smoke test", () => {
         { name: "claude_send_followup", arguments: { session: "job_0123456789abcdef01234567", message: "hi" } },
         { name: "claude_send_followup", arguments: { session: "session_01ABCDEFGH" } },
         { name: "claude_auth_status", arguments: { verbose: true } },
+        { name: "claude_run_local", arguments: { cwd: "/tmp" } },
+        { name: "claude_run_local", arguments: { cwd: "relative/dir", prompt: "x" } },
+        { name: "claude_run_local", arguments: { cwd: "/tmp", prompt: "x", permission_mode: "bypassPermissions" } },
+        { name: "claude_run_local", arguments: { cwd: "/tmp", prompt: "x", permission_mode: "default" } },
+        { name: "claude_run_local", arguments: { cwd: "/tmp", prompt: "x", allowed_tools: ["Bash(rm *)"] } },
+        { name: "claude_run_local", arguments: { cwd: "/tmp", prompt: "x", allowed_tools: ["mcp__github__create_pr"] } },
+        { name: "claude_run_local", arguments: { cwd: "/tmp", prompt: "x", resume: "session_01ABCDEFGH" } },
+        { name: "claude_run_local", arguments: { cwd: "/tmp", prompt: "x", model: "--dangerously-skip-permissions" } },
+        { name: "claude_run_local", arguments: { cwd: "/tmp", prompt: "x", max_turns: 0 } },
+        { name: "claude_run_local", arguments: { cwd: "/tmp", prompt: "x", flags: ["--dangerously-skip-permissions"] } },
       ];
       for (const c of cases) {
         const result = (await client.callTool(c)) as CallToolResult;
@@ -1129,6 +1161,261 @@ describe("stdio smoke test", () => {
       await waitFor(() => !alive(pid), 7_000, "the pty helper to stop claude after the server died");
     } finally {
       await close().catch(() => undefined);
+    }
+  });
+});
+
+describe("claude_run_local", () => {
+  const localRoot = join(tmp, "local-root");
+  const repo = join(localRoot, "app");
+  const plain = join(localRoot, "plain");
+  const outside = join(tmp, "local-outside");
+  mkdirSync(repo, { recursive: true });
+  mkdirSync(plain);
+  mkdirSync(outside);
+  symlinkSync(outside, join(localRoot, "escape"));
+  git(["init", "-b", "main", repo]);
+  writeFileSync(join(repo, "README"), "one\n");
+  git(["add", "README"], repo);
+  git(["commit", "-m", "one"], repo);
+  const SESSION = "11111111-2222-4333-8444-555555555555";
+
+  interface LocalJobBody {
+    job_id: string;
+    status: string;
+    session_id: string | null;
+    cwd: string;
+    permission_mode: string;
+    assistant_messages: number;
+    parsed: boolean;
+    subtype: string | null;
+    is_error: boolean | null;
+    result: string | null;
+    num_turns: number | null;
+    total_cost_usd: number | null;
+    usage: Record<string, number | null> | null;
+    permission_denials: string[];
+    errors: string[];
+    files: { path: string; status: string | null; from: string | null; before: string | null }[] | null;
+    args: string[];
+    cli: { exit_code: number | null; stdout: string; stderr: string };
+  }
+
+  it("refuses every call when CLAUDE_MCP_LOCAL_ROOTS is unset, without spawning the CLI", async () => {
+    const { client, argvCalls, close } = await connect();
+    try {
+      const result = (await client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: repo, prompt: "hi" },
+      })) as CallToolResult;
+      assert.equal(errorBody(result).error.code, "LOCAL_RUNS_DISABLED");
+      assert.deepEqual(argvCalls(), []);
+    } finally {
+      await close();
+    }
+  });
+
+  it("refuses a directory outside the roots, including through a symlink", async () => {
+    const { client, argvCalls, close } = await connect({ CLAUDE_MCP_LOCAL_ROOTS: localRoot });
+    try {
+      for (const cwd of [outside, join(localRoot, "escape"), join(localRoot, "missing"), `${localRoot}/../local-outside`]) {
+        const result = (await client.callTool({ name: "claude_run_local", arguments: { cwd, prompt: "hi" } })) as CallToolResult;
+        assert.equal(errorBody(result).error.code, "REPO_NOT_ALLOWED", cwd);
+      }
+      assert.deepEqual(argvCalls(), []);
+    } finally {
+      await close();
+    }
+  });
+
+  it("runs in a checkout as a job, reports result, usage and changed files, then resumes the session", async () => {
+    writeFileSync(join(repo, "README"), "dirty before the run\n");
+    const { client, argvCalls, metaCalls, close } = await connect({
+      CLAUDE_MCP_LOCAL_ROOTS: localRoot,
+      FAKE_LOCAL_DELAY_MS: "2500",
+      FAKE_LOCAL_WRITE: "new.txt",
+    });
+    try {
+      const started = (await client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: repo, prompt: "add a file", allowed_tools: ["Read", "Edit"], max_turns: 5, model: "sonnet" },
+      })) as CallToolResult;
+      assert.notEqual(started.isError, true);
+      const pending = started.structuredContent as unknown as LocalJobBody;
+      assert.match(pending.job_id, /^job_[0-9a-f]{24}$/);
+      assert.equal(pending.status, "running");
+      assert.equal(pending.session_id, SESSION);
+      assert.equal(pending.files, null);
+      assert.equal(pending.result, null);
+
+      const read = await pollLocal(client, pending.job_id, (job) => job.status === "done");
+      assert.notEqual(read.isError, true);
+      const outer = read.structuredContent as { job: unknown; local_job: LocalJobBody; session_id: string };
+      assert.equal(outer.job, null);
+      assert.equal(outer.session_id, SESSION);
+      const body = outer.local_job;
+      assert.equal(body.cwd, repo);
+      assert.equal(body.permission_mode, "dontAsk");
+      assert.equal(body.parsed, true);
+      assert.equal(body.subtype, "success");
+      assert.equal(body.is_error, false);
+      assert.equal(body.result, "Done: add a file");
+      assert.equal(body.num_turns, 2);
+      assert.equal(body.total_cost_usd, 0.0123);
+      assert.deepEqual(body.usage, { input_tokens: 120, output_tokens: 45, cache_creation_input_tokens: 0, cache_read_input_tokens: 800 });
+      assert.deepEqual(body.permission_denials, ["Bash"]);
+      assert.equal(body.assistant_messages, 1);
+      assert.deepEqual(
+        body.files?.slice().sort((a, b) => a.path.localeCompare(b.path)),
+        [
+          { path: "new.txt", status: "??", from: null, before: null },
+          { path: "README", status: " M", from: null, before: " M" },
+        ],
+      );
+      assert.equal(body.cli.exit_code, 0);
+      assert.equal(body.cli.stdout, "", "the stream-json transcript is not returned");
+      assert.deepEqual(argvCalls()[0], [
+        "-p",
+        "--output-format=stream-json",
+        "--verbose",
+        "--permission-mode=dontAsk",
+        "--model=sonnet",
+        "--max-turns=5",
+        "--allowedTools=Read,Edit",
+        "--",
+        "add a file",
+      ]);
+      assert.equal(metaCalls()[0]?.cwd, repo);
+      assert.equal(metaCalls()[0]?.stdoutIsTTY, false);
+
+      const resumed = (await client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: repo, prompt: "keep going", resume: SESSION, permission_mode: "acceptEdits" },
+      })) as CallToolResult;
+      const next = await pollLocal(client, (resumed.structuredContent as { job_id: string }).job_id, (job) => job.status === "done");
+      const nextBody = (next.structuredContent as { local_job: LocalJobBody }).local_job;
+      assert.equal(nextBody.session_id, SESSION);
+      assert.equal(nextBody.result, "Done: keep going");
+      assert.deepEqual(argvCalls()[1], [
+        "-p",
+        "--output-format=stream-json",
+        "--verbose",
+        "--permission-mode=acceptEdits",
+        `--resume=${SESSION}`,
+        "--",
+        "keep going",
+      ]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("refuses Bash and auto mode unless CLAUDE_MCP_LOCAL_ALLOW_SHELL is set", async () => {
+    const shellCalls = [
+      { cwd: plain, prompt: "x", allowed_tools: ["Read", "Bash"] },
+      { cwd: plain, prompt: "x", permission_mode: "auto" },
+    ];
+    const off = await connect({ CLAUDE_MCP_LOCAL_ROOTS: localRoot });
+    try {
+      for (const args of shellCalls) {
+        const result = (await off.client.callTool({ name: "claude_run_local", arguments: args })) as CallToolResult;
+        assert.equal(errorBody(result).error.code, "LOCAL_SHELL_DISABLED", JSON.stringify(args));
+      }
+      assert.deepEqual(off.argvCalls(), []);
+    } finally {
+      await off.close();
+    }
+    const on = await connect({ CLAUDE_MCP_LOCAL_ROOTS: localRoot, CLAUDE_MCP_LOCAL_ALLOW_SHELL: "1" });
+    try {
+      for (const args of shellCalls) {
+        const result = (await on.client.callTool({ name: "claude_run_local", arguments: args })) as CallToolResult;
+        assert.notEqual(result.isError, true, JSON.stringify(args));
+        await pollLocal(on.client, (result.structuredContent as { job_id: string }).job_id, (job) => job.status === "done");
+      }
+      assert.ok(on.argvCalls()[0]?.includes("--allowedTools=Read,Bash"));
+      assert.ok(on.argvCalls()[1]?.includes("--permission-mode=auto"));
+    } finally {
+      await on.close();
+    }
+  });
+
+  it("returns an error result as data, and files null outside a git work tree", async () => {
+    const { client, close } = await connect({ CLAUDE_MCP_LOCAL_ROOTS: localRoot, FAKE_LOCAL_MODE: "max_turns" });
+    try {
+      const result = (await client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: plain, prompt: "too long", max_turns: 3 },
+      })) as CallToolResult;
+      assert.notEqual(result.isError, true);
+      const body = result.structuredContent as unknown as LocalJobBody;
+      assert.equal(body.status, "done");
+      assert.equal(body.is_error, true);
+      assert.equal(body.subtype, "error_max_turns");
+      assert.equal(body.result, null);
+      assert.deepEqual(body.errors, ["Reached maximum number of turns (3)"]);
+      assert.equal(body.session_id, SESSION);
+      assert.equal(body.files, null);
+      assert.equal(body.cli.exit_code, 1);
+    } finally {
+      await close();
+    }
+  });
+
+  it("maps a run with no result line to CLI_EXIT_NONZERO, and a signed-out CLI to CLI_NOT_SIGNED_IN", async () => {
+    const failed = await connect({ CLAUDE_MCP_LOCAL_ROOTS: localRoot, FAKE_LOCAL_MODE: "no_result" });
+    try {
+      const result = (await failed.client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: plain, prompt: "x" },
+      })) as CallToolResult;
+      const error = errorBody(result).error;
+      assert.equal(error.code, "CLI_EXIT_NONZERO");
+      assert.match(error.message, /something went wrong/);
+    } finally {
+      await failed.close();
+    }
+    const signedOut = await connect({ CLAUDE_MCP_LOCAL_ROOTS: localRoot, FAKE_CLAUDE_MODE: "signed_out" });
+    try {
+      const result = (await signedOut.client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: plain, prompt: "x" },
+      })) as CallToolResult;
+      assert.equal(errorBody(result).error.code, "CLI_NOT_SIGNED_IN");
+    } finally {
+      await signedOut.close();
+    }
+  });
+
+  it("cancels a running local job and stops claude -p", async () => {
+    const { client, metaCalls, close } = await connect({ CLAUDE_MCP_LOCAL_ROOTS: localRoot, FAKE_LOCAL_MODE: "hang" });
+    try {
+      const started = (await client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: plain, prompt: "never ends" },
+      })) as CallToolResult;
+      const pending = started.structuredContent as unknown as LocalJobBody;
+      assert.equal(pending.status, "running");
+      assert.equal(pending.session_id, SESSION);
+      const pid = metaCalls()[0]?.pid ?? 0;
+      assert.ok(alive(pid));
+
+      const cancel = (await client.callTool({
+        name: "claude_cancel_session",
+        arguments: { session: pending.job_id },
+      })) as CallToolResult;
+      assert.notEqual(cancel.isError, true);
+      const body = cancel.structuredContent as { job: unknown; local_job: LocalJobBody; cancelled: boolean; stopped: boolean };
+      assert.equal(body.job, null);
+      assert.equal(body.cancelled, true);
+      assert.equal(body.stopped, true);
+      assert.equal(body.local_job.status, "cancelled");
+      assert.equal(body.local_job.session_id, SESSION);
+      assert.equal(alive(pid), false, "claude -p should be gone");
+
+      const read = await pollLocal(client, pending.job_id, (job) => job.status === "cancelled");
+      assert.equal((read.structuredContent as { local_job: LocalJobBody }).local_job.status, "cancelled");
+    } finally {
+      await close();
     }
   });
 });
