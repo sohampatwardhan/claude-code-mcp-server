@@ -2,15 +2,59 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { TrustFileError, ensureWorkspaceTrusted, isTrustPrompt, resolveTrustProjectPath } from "../src/trust.js";
+import { fileURLToPath } from "node:url";
+
+import {
+  KEY_DOWN,
+  KEY_UP,
+  TrustFileError,
+  ensureWorkspaceTrusted,
+  isTrustMenuDrawn,
+  isTrustPrompt,
+  resolveTrustProjectPath,
+  trustAnswerKeys,
+} from "../src/trust.js";
+
+// The dialog exactly as Claude Code 2.1.316 drew it on a pty (only the folder path was replaced).
+const CURRENT_DIALOG = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "../../test/fixtures/trust-dialog-2.1.316.txt"),
+  "utf8",
+);
 
 // realpath: on macOS tmpdir() is under /var, a symlink to /private/var, and git and
 // process.cwd() report the /private/var form.
 const tmp = realpathSync(mkdtempSync(join(tmpdir(), "claude-mcp-trust-")));
 after(() => rmSync(tmp, { recursive: true, force: true }));
+
+describe("Claude Code 2.1.316 trust dialog", () => {
+  it("is recognised although every word is placed with a cursor move", () => {
+    assert.equal(isTrustPrompt(CURRENT_DIALOG), true);
+    assert.equal(isTrustMenuDrawn(CURRENT_DIALOG), true);
+  });
+
+  it("is answered by moving down from the selected No, exit to Yes, then Enter", () => {
+    assert.deepEqual(trustAnswerKeys(CURRENT_DIALOG), [KEY_DOWN, "\r"]);
+  });
+
+  it("answers with Enter alone when Yes is already selected, and up when Yes is above", () => {
+    assert.deepEqual(trustAnswerKeys("Do you trust the files in this folder?\n❯ 1. Yes, I trust this folder\n  2. No, exit\n"), ["\r"]);
+    assert.deepEqual(trustAnswerKeys("Is this a project you created or one you trust?\n  Yes, I trust this folder\n❯ No, exit\n"), [KEY_UP, "\r"]);
+  });
+
+  it("reads only the last drawing of the menu", () => {
+    const redrawn = `${CURRENT_DIALOG}\n❯ Yes, I trust this folder\n  No, exit\n`;
+    assert.deepEqual(trustAnswerKeys(redrawn), ["\r"]);
+  });
+
+  it("returns null when the menu or its selection can't be read", () => {
+    assert.equal(trustAnswerKeys("Quick safety check: Is this a project you created or one you trust?\n"), null);
+    assert.equal(isTrustMenuDrawn("Quick safety check: Is this a project you created or one you trust?\n"), false);
+    assert.equal(trustAnswerKeys("Is this a project you created or one you trust?\n  No, exit\n  Yes, I trust this folder\n"), null);
+  });
+});
 
 describe("isTrustPrompt", () => {
   it("matches the long and short dialog questions", () => {

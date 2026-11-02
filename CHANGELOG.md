@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- Create no longer hangs for the whole timeout at Claude Code 2.1.316's workspace-trust dialog ("Quick safety check: Is this a project you created or one you trust?"). The dialog draws each word with a cursor move instead of spaces, so the server didn't recognise it. CLI text is now rendered with those moves as spaces, both wordings are recognised, and the call fails with `WORKSPACE_NOT_TRUSTED` in under a second (#21).
+- With `CLAUDE_MCP_TRUST_CWD`, the dialog is answered by moving to "Yes, I trust this folder" before pressing Enter. Current versions select "No, exit" first, so Enter alone would have exited. An unreadable selection is refused instead of answered (#21).
+- Create and `claude_run_local` check `claude auth status` first and fail in about a second with `CLI_NOT_SIGNED_IN` when the CLI is signed out, without starting a clone or session. "Cloud sessions need a claude.ai sign-in" is now recognised as a sign-in error (#22).
+
+### Added
+
 - `claude_create_cloud_session` runs in the background and returns within about 2 seconds, so a slow clone or `claude --cloud` on a large repository no longer hits the MCP client's request timeout (`-32001`). The output gains `job_id`, `status` (`cloning`, `starting`, `running`, `done`) and `elapsed_ms`. When `status` is not `done`, poll `claude_get_session` with the `job_id`.
 - `claude_get_session` accepts a `job_id` and returns that create's progress or result in `job`, or its error. `session_id`, `repo` and `cli` in its output are now nullable.
 - New `JOB_NOT_FOUND` error for job ids this server doesn't hold (jobs are in memory only).

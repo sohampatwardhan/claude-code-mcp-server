@@ -15,18 +15,21 @@ const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
  * a short wait lets the dialog install its key handler first.
  */
 const TRUST_ACCEPT_DELAY_MS = 100;
+/** Gap between answer keystrokes, so the menu handles a move before Enter. */
+const TRUST_KEY_GAP_MS = 150;
 
 export interface PtyRunResult extends RunResult {
   /**
    * `refused` when the workspace-trust dialog was shown and this run was told
-   * not to answer it. `accepted` when it was shown and an Enter key was sent.
+   * not to answer it. `accepted` when it was shown and the answer keys were sent.
    */
   trustPrompt: "absent" | "accepted" | "refused";
   /** True when the run was stopped because it printed nothing for `idleTimeoutMs`. */
   idleTimedOut: boolean;
 }
 
-export type PtyTrustDecision = "accept" | "refuse" | "wait";
+/** `wait` for more output, `refuse` and stop the run, or send `keys` once to answer the dialog. */
+export type PtyTrustDecision = "refuse" | "wait" | { keys: readonly string[] };
 
 export interface PtyRunOptions {
   /** Python interpreter used to allocate the pty. */
@@ -286,14 +289,19 @@ export function runCliPty(bin: string, args: string[], timeoutMs: number, option
         return;
       }
       trustPrompt = "accepted";
-      acceptTimer = setTimeout(() => {
-        if (settled) return;
+      const keys = [...decision.keys];
+      const sendNext = () => {
+        const key = keys.shift();
+        if (settled || key === undefined) return;
         try {
-          child.stdin.write("\r");
+          child.stdin.write(key);
         } catch {
           // stdin already closed
+          return;
         }
-      }, TRUST_ACCEPT_DELAY_MS);
+        if (keys.length > 0) acceptTimer = setTimeout(sendNext, TRUST_KEY_GAP_MS);
+      };
+      acceptTimer = setTimeout(sendNext, TRUST_ACCEPT_DELAY_MS);
     };
 
     const progress = new StringDecoder("utf8");

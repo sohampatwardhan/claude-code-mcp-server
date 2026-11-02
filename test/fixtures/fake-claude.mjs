@@ -5,7 +5,8 @@
 //   FAKE_CLAUDE_ARGV_LOG   if set, the received argv is appended here as a JSON line
 //   FAKE_CLAUDE_META_LOG   if set, { args, cwd, pid, stdoutIsTTY, stdinIsTTY } is appended
 //   FAKE_CLAUDE_STDIN_LOG  if set, bytes read while the trust dialog is up are appended
-//   FAKE_CLAUDE_MODE       "fail" -> exit 1 with stderr; "hang" -> never exit;
+//   FAKE_CLAUDE_MODE       "fail" -> exit 1 with stderr; "hang" -> never exit (except
+//                          `auth status`, so the sign-in preflight still answers);
 //                          "garbled" -> exit 0 with unparseable output;
 //                          "signed_out" -> every command fails like a CLI with no login
 //                          (auth status prints loggedIn false and exits 1)
@@ -14,6 +15,13 @@
 //                          unset    -> create does not ask (folder already trusted)
 //   FAKE_CLAUDE_TRUST_QUESTION
 //                          override the dialog question (default is the long form)
+//   FAKE_CLAUDE_TRUST_LAYOUT
+//                          "2.1.316" draws the current dialog instead: "Quick safety
+//                          check" question, words placed with CSI n G, "❯ No, exit"
+//                          selected above "Yes, I trust this folder"; the down arrow
+//                          then Enter accepts, Enter alone exits 1
+//   FAKE_AUTH_STATUS       `auth status` only: "out" prints loggedIn false and exits 1;
+//                          "garbled" prints non-JSON; everything else still succeeds
 //   FAKE_CLAUDE_CREATE_DELAY_MS
 //                          create waits this long before printing the session
 //   FAKE_CLAUDE_CREATE_LINGER_MS
@@ -61,7 +69,7 @@ const ID = "session_01FakeSessionId0000000000";
 
 const isCreate = () => args[0]?.startsWith("--cloud=") === true && !args.includes("-p");
 
-if (mode === "hang") {
+if (mode === "hang" && !(args[0] === "auth" && args[1] === "status")) {
   setInterval(() => {}, 1_000);
 } else if (mode === "fail") {
   process.stderr.write("Error: Unable to create cloud session: environment unavailable\n");
@@ -75,6 +83,10 @@ if (mode === "hang") {
   process.exit(1);
 } else if (mode === "garbled") {
   process.stdout.write("something unexpected happened\n");
+} else if (args[0] === "auth" && args[1] === "status" && process.env.FAKE_AUTH_STATUS === "out") {
+  process.stdout.write(JSON.stringify({ loggedIn: false, authMethod: "claude.ai", apiProvider: "firstParty" }) + "\n", () => process.exit(1));
+} else if (args[0] === "auth" && args[1] === "status" && process.env.FAKE_AUTH_STATUS === "garbled") {
+  process.stdout.write("auth: something unexpected\n");
 } else if (args[0] === "auth" && args[1] === "status") {
   process.stdout.write(
     JSON.stringify(
@@ -103,7 +115,9 @@ if (mode === "hang") {
     );
     process.exit(3);
   }
-  if (trustDialogRequired()) {
+  if (trustDialogRequired() && process.env.FAKE_CLAUDE_TRUST_LAYOUT === "2.1.316") {
+    showCurrentTrustDialog();
+  } else if (trustDialogRequired()) {
     const question = process.env.FAKE_CLAUDE_TRUST_QUESTION ?? "Do you trust the files in this folder?";
     writeSync(1, `${question}\n❯ 1. Yes, I trust this folder\n  2. No, exit\n`);
     process.stdin.on("data", (chunk) => {
@@ -269,4 +283,54 @@ function handleLocal() {
       process.stdout.write(line.slice(20) + "\n", () => process.exit(0));
     }, 20);
   }, Number(process.env.FAKE_LOCAL_DELAY_MS ?? "0"));
+}
+
+/**
+ * The trust dialog as Claude Code 2.1.316 draws it: every word placed with
+ * CSI n G (no spaces), "No, exit" selected first. Down then Enter trusts the
+ * folder; Enter on "No, exit" exits 1, like the real CLI.
+ */
+function showCurrentTrustDialog() {
+  const place = (words, start = 2) => {
+    let col = start;
+    return words
+      .map((word) => {
+        const out = `\u001b[${col}G${word}`;
+        col += [...word].length + 1;
+        return out;
+      })
+      .join("");
+  };
+  const draw = (selected) => {
+    const lines = [
+      "\u001b[2G\u001b[1mAccessing workspace:\u001b[22m",
+      `\u001b[2G${process.cwd()}`,
+      "",
+      place("Quick safety check: Is this a project you created or one you trust? (Like your".split(" ")),
+      place("own code, a well-known open source project, or work from your team). If not,".split(" ")),
+      "",
+      `\u001b[2G\u001b[38;5;105m${selected === 0 ? "❯" : " "}\u001b[4GNo,\u001b[8Gexit\u001b[39m`,
+      `\u001b[2G${selected === 1 ? "❯" : " "}\u001b[4GYes,\u001b[9GI\u001b[11Gtrust\u001b[17Gthis\u001b[22Gfolder`,
+      "",
+      place("Enter to confirm · Esc to cancel".split(" ")),
+    ];
+    writeSync(1, lines.join("\r\r\n") + "\r\r\n");
+  };
+  let selected = 0;
+  draw(selected);
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  process.stdin.on("data", (chunk) => {
+    if (process.env.FAKE_CLAUDE_STDIN_LOG) appendFileSync(process.env.FAKE_CLAUDE_STDIN_LOG, chunk);
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    if (text.includes("\u001b[B")) selected = 1;
+    if (text.includes("\u001b[A")) selected = 0;
+    if (text.includes("\r") || text.includes("\n")) {
+      if (selected === 1) {
+        writeCreated();
+        process.exit(0);
+      }
+      process.stderr.write("fake-claude: chose No, exit\n");
+      process.exit(1);
+    }
+  });
 }

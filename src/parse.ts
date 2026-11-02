@@ -53,8 +53,62 @@ const TERMINAL_CONTROL_REGEX = new RegExp(
   "g",
 );
 
+/**
+ * Cursor moves (`CSI n C` forward, `CSI n G` to column n), and the other
+ * escape sequences and line breaks that change the column. Claude Code's
+ * full-screen UI places each word with `CSI n G` instead of printing spaces.
+ */
+// eslint-disable-next-line no-control-regex
+const CURSOR_TOKEN_REGEX = new RegExp(
+  [
+    "\\u001b\\[(\\d*)([CG])",
+    "\\u001b\\][^\\u0007\\u001b]*(?:\\u0007|\\u001b\\\\)",
+    "\\u001b[P^_][\\s\\S]*?(?:\\u001b\\\\|\\u0007)",
+    "\\u001b\\[[\\x30-\\x3f]*[\\x20-\\x2f]*[\\x40-\\x7e]",
+    "\\u001b[\\x20-\\x2f]*[\\x30-\\x7e]",
+    "\\r\\n|\\r|\\n",
+  ].join("|"),
+  "g",
+);
+
+/** Widest gap a single cursor move may turn into. */
+const MAX_CURSOR_GAP = 500;
+
+/**
+ * Turn cursor moves into the spaces they leave on screen, so `Is\u001b[25Gthis`
+ * reads `Is this`. A move to a column already passed adds nothing. Other
+ * escape sequences are kept for `stripAnsi` to remove.
+ */
+function expandCursorMoves(text: string): string {
+  let out = "";
+  let column = 0;
+  let last = 0;
+  for (const match of text.matchAll(CURSOR_TOKEN_REGEX)) {
+    const plain = text.slice(last, match.index);
+    out += plain;
+    column += [...plain].length;
+    last = match.index + match[0].length;
+    const [token, count, kind] = match;
+    if (kind === "C") {
+      const gap = Math.min(Math.max(Number(count || "1"), 1), MAX_CURSOR_GAP);
+      out += " ".repeat(gap);
+      column += gap;
+    } else if (kind === "G") {
+      const target = Math.min(Math.max(Number(count || "1"), 1), MAX_CURSOR_GAP) - 1;
+      if (target > column) {
+        out += " ".repeat(target - column);
+        column = target;
+      }
+    } else {
+      out += token;
+      if (token === "\n" || token === "\r" || token === "\r\n") column = 0;
+    }
+  }
+  return out + text.slice(last);
+}
+
 export function stripAnsi(text: string): string {
-  return text.replace(TERMINAL_CONTROL_REGEX, "");
+  return expandCursorMoves(text).replace(TERMINAL_CONTROL_REGEX, "");
 }
 
 /** Escape-free text with pty `\r` newlines folded into `\n`. */
