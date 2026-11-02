@@ -78,3 +78,34 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "${TAG}" --generate-notes --title "${TAG}"
+
+  publish-github-packages:
+    # Mirrors the npmjs release to GitHub Packages so the repo sidebar lists the package.
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Node for GitHub Packages
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: "@sohampatwardhan"
+          package-manager-cache: false
+
+      - name: Install
+        run: npm ci
+
+      - name: Publish to GitHub Packages
+        # Registry comes from the .npmrc setup-node writes for the scope; package.json has no publishConfig.registry.
+        # GitHub Packages does not support --provenance.
+        run: npm publish --registry=https://npm.pkg.github.com
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
