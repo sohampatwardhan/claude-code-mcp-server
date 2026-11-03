@@ -31,6 +31,8 @@ const SIGN_IN_PATTERNS: RegExp[] = [
   /\bauthentication (?:failed|required|error)\b/i,
   /\bmust be (?:logged|signed) in\b/i,
   /\b(?:log|sign) in (?:to|with) (?:your )?claude(?:\.ai)?\b/i,
+  /\bneeds? a claude\.ai sign-?in\b/i,
+  /\bsign-?in (?:has )?expired\b/i,
   /"loggedIn"\s*:\s*false/,
 ];
 

@@ -12,6 +12,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
+import { ISSUE_REPORTING } from "../src/server.js";
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const serverEntry = join(root, "dist/src/index.js");
 const fakeClaude = join(root, "test/fixtures/fake-claude.mjs");
@@ -53,24 +55,30 @@ async function connect(extraEnv: Record<string, string> = {}) {
     stderrText += chunk.toString("utf8");
   });
   await client.connect(transport);
-  const argvCalls = (): string[][] => {
+  // `auth status` calls are hidden by default: create and local runs make one as a sign-in
+  // preflight, which would shift every index. allArgvCalls / allMetaCalls keep them.
+  const isAuthStatus = (args: string[]) => args[0] === "auth" && args[1] === "status";
+  const allArgvCalls = (): string[][] => {
     try {
       return readFileSync(argvLog, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as string[]);
     } catch {
       return [];
     }
   };
-  const metaCalls = (): { cwd: string; pid: number; stdoutIsTTY: boolean; stdinIsTTY: boolean }[] => {
+  const argvCalls = (): string[][] => allArgvCalls().filter((args) => !isAuthStatus(args));
+  type Meta = { args: string[]; cwd: string; pid: number; stdoutIsTTY: boolean; stdinIsTTY: boolean };
+  const allMetaCalls = (): Meta[] => {
     try {
       return readFileSync(metaLog, "utf8")
         .trim()
         .split("\n")
         .filter(Boolean)
-        .map((l) => JSON.parse(l) as { cwd: string; pid: number; stdoutIsTTY: boolean; stdinIsTTY: boolean });
+        .map((l) => JSON.parse(l) as Meta);
     } catch {
       return [];
     }
   };
+  const metaCalls = (): Meta[] => allMetaCalls().filter((meta) => !isAuthStatus(meta.args));
   const stdinBytes = (): Buffer => {
     try {
       return readFileSync(stdinLog);
@@ -81,7 +89,9 @@ async function connect(extraEnv: Record<string, string> = {}) {
   return {
     client,
     argvCalls,
+    allArgvCalls,
     metaCalls,
+    allMetaCalls,
     stdinBytes,
     serverPid: transport.pid,
     stderr: () => stderrText,
@@ -214,7 +224,7 @@ function errorBody(result: CallToolResult): { error: { code: string; message: st
 }
 
 describe("stdio smoke test", () => {
-  it("lists exactly the six tools, each with a strict input schema", async () => {
+  it("lists exactly the seven tools, each with a strict input schema", async () => {
     const { client, close } = await connect();
     try {
       const { tools } = await client.listTools();
@@ -225,6 +235,7 @@ describe("stdio smoke test", () => {
         "claude_get_session",
         "claude_run_local",
         "claude_send_followup",
+        "claude_usage",
       ]);
       for (const tool of tools) {
         assert.equal(tool.inputSchema.type, "object");
@@ -241,11 +252,18 @@ describe("stdio smoke test", () => {
       assert.deepEqual(byName.claude_run_local?.inputSchema.required?.slice().sort(), ["cwd", "prompt"]);
       assert.match(byName.claude_run_local?.description ?? "", /LOCAL_RUNS_DISABLED/);
       assert.match(client.getInstructions() ?? "", /claude_run_local/);
+      assert.match(client.getInstructions() ?? "", /claude_usage/);
+      assert.equal(byName.claude_usage?.annotations?.readOnlyHint, true);
       assert.match(client.getInstructions() ?? "", /can't push its branch to GitHub/);
       assert.match(client.getInstructions() ?? "", /git format-patch/);
       assert.match(client.getInstructions() ?? "", /claude_get_session/);
       assert.match(client.getInstructions() ?? "", /npm install -g @anthropic-ai\/claude-code/);
       assert.match(client.getInstructions() ?? "", /job_id/);
+      assert.ok((client.getInstructions() ?? "").includes(ISSUE_REPORTING), "instructions carry the issue-reporting guidance");
+      assert.match(ISSUE_REPORTING, /github\.com\/sohampatwardhan\/claude-code-mcp-server\/issues/);
+      assert.ok(readFileSync(join(root, "README.md"), "utf8").includes(`> ${ISSUE_REPORTING}`), "README block matches ISSUE_REPORTING");
+      const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version: string };
+      assert.equal(client.getServerVersion()?.version, pkg.version);
       assert.match(byName.claude_get_session?.description ?? "", /job id/);
       assert.doesNotMatch(client.getInstructions() ?? "", /no status tool/);
       assert.match(byName.claude_create_cloud_session?.description ?? "", /git format-patch/);
@@ -300,7 +318,7 @@ describe("stdio smoke test", () => {
   });
 
   it("runs create on a pty and leaves follow-up and auth on pipes", async () => {
-    const { client, metaCalls, argvCalls, close } = await connect();
+    const { client, allMetaCalls, argvCalls, close } = await connect();
     try {
       await client.callTool({ name: "claude_create_cloud_session", arguments: { description: "$(rm -rf /) `id`" } });
       await client.callTool({
@@ -308,10 +326,14 @@ describe("stdio smoke test", () => {
         arguments: { session: "session_01Target00000000", message: "next" },
       });
       await client.callTool({ name: "claude_auth_status", arguments: {} });
-      const meta = metaCalls();
-      assert.equal(meta[0]?.stdoutIsTTY, true);
-      assert.equal(meta[1]?.stdoutIsTTY, false);
+      // The sign-in preflight, create, follow-up, then the claude_auth_status call.
+      const meta = allMetaCalls();
+      assert.deepEqual(meta[0]?.args, ["auth", "status"]);
+      assert.equal(meta[0]?.stdoutIsTTY, false);
+      assert.equal(meta[1]?.stdoutIsTTY, true);
       assert.equal(meta[2]?.stdoutIsTTY, false);
+      assert.deepEqual(meta[3]?.args, ["auth", "status"]);
+      assert.equal(meta[3]?.stdoutIsTTY, false);
       assert.deepEqual(argvCalls()[0], ["--cloud=$(rm -rf /) `id`"]);
     } finally {
       await close();
@@ -396,6 +418,8 @@ describe("stdio smoke test", () => {
         { name: "claude_send_followup", arguments: { session: "job_0123456789abcdef01234567", message: "hi" } },
         { name: "claude_send_followup", arguments: { session: "session_01ABCDEFGH" } },
         { name: "claude_auth_status", arguments: { verbose: true } },
+        { name: "claude_usage", arguments: { refresh: "yes" } },
+        { name: "claude_usage", arguments: { args: ["--model=opus"] } },
         { name: "claude_run_local", arguments: { cwd: "/tmp" } },
         { name: "claude_run_local", arguments: { cwd: "relative/dir", prompt: "x" } },
         { name: "claude_run_local", arguments: { cwd: "/tmp", prompt: "x", permission_mode: "bypassPermissions" } },
@@ -455,7 +479,10 @@ describe("stdio smoke test", () => {
   it("enforces CLAUDE_MCP_TIMEOUT_MS", async () => {
     const { client, close } = await connect({ FAKE_CLAUDE_MODE: "hang", CLAUDE_MCP_TIMEOUT_MS: "300" });
     try {
-      const result = (await client.callTool({ name: "claude_auth_status", arguments: {} })) as CallToolResult;
+      const result = (await client.callTool({
+        name: "claude_send_followup",
+        arguments: { session: "session_01FakeSessionId0000000000", message: "hangs" },
+      })) as CallToolResult;
       assert.equal(errorBody(result).error.code, "CLI_TIMEOUT");
     } finally {
       await close();
@@ -602,7 +629,7 @@ describe("stdio smoke test", () => {
     const home = join(tmp, "home-cwd");
     mkdirSync(work);
     mkdirSync(home);
-    const { client, metaCalls, close } = await connect({
+    const { client, allMetaCalls, close } = await connect({
       HOME: home,
       CLAUDE_MCP_CWD: work,
       CLAUDE_MCP_TRUST_CWD: "1",
@@ -620,9 +647,10 @@ describe("stdio smoke test", () => {
       assert.equal(s.parsed, true);
       assert.equal(s.title, "from cwd env");
       assert.doesNotMatch(s.cli.stdout, /[\u0000-\u0008\u000e-\u001f]/);
-      const meta = metaCalls();
-      assert.equal(meta[0]?.cwd, work);
-      assert.equal(meta[1]?.cwd, work);
+      // claude_auth_status, the create's sign-in preflight, then claude --cloud.
+      const meta = allMetaCalls();
+      assert.deepEqual(meta.map((m) => m.args[0]), ["auth", "auth", "--cloud=from cwd env"]);
+      for (const m of meta) assert.equal(m.cwd, work);
       const saved = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")) as {
         projects: Record<string, { hasTrustDialogAccepted?: boolean }>;
       };
@@ -1196,6 +1224,7 @@ describe("claude_run_local", () => {
     total_cost_usd: number | null;
     usage: Record<string, number | null> | null;
     permission_denials: string[];
+    rate_limit: { status: string | null; resets_at: number | null; utilization: number | null; type: string | null } | null;
     errors: string[];
     files: { path: string; status: string | null; from: string | null; before: string | null }[] | null;
     args: string[];
@@ -1266,6 +1295,7 @@ describe("claude_run_local", () => {
       assert.equal(body.total_cost_usd, 0.0123);
       assert.deepEqual(body.usage, { input_tokens: 120, output_tokens: 45, cache_creation_input_tokens: 0, cache_read_input_tokens: 800 });
       assert.deepEqual(body.permission_denials, ["Bash"]);
+      assert.equal(body.rate_limit, null);
       assert.equal(body.assistant_messages, 1);
       assert.deepEqual(
         body.files?.slice().sort((a, b) => a.path.localeCompare(b.path)),
@@ -1424,6 +1454,251 @@ describe("claude_run_local", () => {
 
       const read = await pollLocal(client, pending.job_id, (job) => job.status === "cancelled");
       assert.equal((read.structuredContent as { local_job: LocalJobBody }).local_job.status, "cancelled");
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe("trust prompt and sign-in preflight (#21, #22)", () => {
+  it("refuses the Claude Code 2.1.316 trust dialog in seconds instead of waiting for the timeout", async () => {
+    const { client, stdinBytes, close } = await connect({
+      FAKE_CLAUDE_TRUST: "prompt",
+      FAKE_CLAUDE_TRUST_LAYOUT: "2.1.316",
+      CLAUDE_MCP_TIMEOUT_MS: "600000",
+    });
+    try {
+      const started = Date.now();
+      const result = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "untrusted folder" },
+      })) as CallToolResult;
+      const error = errorBody(result).error;
+      assert.equal(error.code, "WORKSPACE_NOT_TRUSTED");
+      assert.match(error.message, /CLAUDE_MCP_TRUST_CWD=1/);
+      assert.ok(Date.now() - started < 10_000, "fails fast");
+      assert.equal(stdinBytes().length, 0, "the dialog is not answered");
+    } finally {
+      await close();
+    }
+  });
+
+  it("with CLAUDE_MCP_TRUST_CWD, moves to Yes before pressing Enter on the 2.1.316 dialog", async () => {
+    const home = join(tmp, "home-trust-316");
+    mkdirSync(home);
+    const { client, stdinBytes, close } = await connect({
+      HOME: home,
+      CLAUDE_MCP_TRUST_CWD: "1",
+      FAKE_CLAUDE_TRUST: "prompt",
+      FAKE_CLAUDE_TRUST_LAYOUT: "2.1.316",
+    });
+    try {
+      const result = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "trusted by keystroke" },
+      })) as CallToolResult;
+      assert.notEqual(result.isError, true, JSON.stringify(result.content));
+      assert.equal((result.structuredContent as { parsed: boolean }).parsed, true);
+      assert.equal(stdinBytes().toString("utf8"), "\u001b[B\r", "down arrow, then Enter");
+    } finally {
+      await close();
+    }
+  });
+
+  it("fails create and local runs with CLI_NOT_SIGNED_IN before starting them when auth status says signed out", async () => {
+    const localRoot = join(tmp, "preflight-local");
+    mkdirSync(localRoot, { recursive: true });
+    const { client, allArgvCalls, close } = await connect({ FAKE_AUTH_STATUS: "out", CLAUDE_MCP_LOCAL_ROOTS: localRoot });
+    try {
+      const started = Date.now();
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "signed out" },
+      })) as CallToolResult;
+      const error = errorBody(created).error;
+      assert.equal(error.code, "CLI_NOT_SIGNED_IN");
+      assert.match(error.message, /loggedIn false \(auth method: claude\.ai\)/);
+      assert.match(error.message, /claude auth login/);
+      assert.ok(Date.now() - started < 5_000);
+      const local = (await client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: localRoot, prompt: "signed out" },
+      })) as CallToolResult;
+      assert.equal(errorBody(local).error.code, "CLI_NOT_SIGNED_IN");
+      assert.deepEqual(allArgvCalls(), [
+        ["auth", "status"],
+        ["auth", "status"],
+      ], "neither --cloud nor -p ran");
+    } finally {
+      await close();
+    }
+  });
+
+  it("checks sign-in once a minute, and lets work go ahead when auth status can't be read", async () => {
+    const ok = await connect();
+    try {
+      for (const description of ["first", "second"]) {
+        const result = (await ok.client.callTool({ name: "claude_create_cloud_session", arguments: { description } })) as CallToolResult;
+        assert.notEqual(result.isError, true);
+      }
+      assert.deepEqual(ok.allArgvCalls(), [["auth", "status"], ["--cloud=first"], ["--cloud=second"]]);
+    } finally {
+      await ok.close();
+    }
+    const garbled = await connect({ FAKE_AUTH_STATUS: "garbled" });
+    try {
+      const result = (await garbled.client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "auth unreadable" },
+      })) as CallToolResult;
+      assert.notEqual(result.isError, true);
+      assert.deepEqual(garbled.argvCalls(), [["--cloud=auth unreadable"]]);
+    } finally {
+      await garbled.close();
+    }
+  });
+});
+
+describe("claude_usage", () => {
+  const usageArgs = ["-p", "--restricted", "--strict-mcp-config", "--output-format=stream-json", "--verbose", "--", "/usage"];
+
+  interface UsageBody {
+    checked_at: string;
+    cached: boolean;
+    parsed: boolean;
+    windows: { kind: string; percent: number; resets_at: string | null; scope: string | null; is_active: boolean }[] | null;
+    extra_usage: { is_enabled: boolean } | null;
+    stop_percent: number | null;
+    blocked_by: { kind: string; percent: number } | null;
+    args: string[];
+    cli: { exit_code: number | null; stdout: string; stderr: string };
+  }
+
+  it("reads plan usage with the restricted /usage argv, reuses it for 60 s, and refreshes on request", async () => {
+    const { client, argvCalls, metaCalls, close } = await connect({ CLAUDE_MCP_REPO_CACHE: join(tmp, "usage-cache") });
+    try {
+      const first = (await client.callTool({ name: "claude_usage", arguments: {} })) as CallToolResult;
+      assert.notEqual(first.isError, true);
+      const body = first.structuredContent as unknown as UsageBody;
+      assert.equal(body.parsed, true);
+      assert.equal(body.cached, false);
+      assert.ok(!Number.isNaN(Date.parse(body.checked_at)));
+      assert.deepEqual(
+        body.windows?.map((w) => [w.kind, w.percent, w.scope, w.is_active]),
+        [
+          ["session", 68, null, true],
+          ["weekly_all", 10, null, false],
+          ["weekly_scoped", 99, "Cowork", false],
+        ],
+      );
+      assert.equal(body.windows?.[0]?.resets_at, "2026-11-02T22:10:00.474794+00:00");
+      assert.equal(body.extra_usage?.is_enabled, false);
+      assert.equal(body.stop_percent, null);
+      assert.equal(body.blocked_by, null);
+      assert.equal(body.cli.stdout, "", "the report's text and activity summary are not returned");
+      assert.deepEqual(argvCalls(), [usageArgs]);
+      assert.equal(metaCalls()[0]?.cwd, join(tmp, "usage-cache"));
+
+      const second = (await client.callTool({ name: "claude_usage", arguments: {} })) as CallToolResult;
+      assert.equal((second.structuredContent as unknown as UsageBody).cached, true);
+      assert.equal(argvCalls().length, 1, "a reading under 60 s old is reused");
+
+      const refreshed = (await client.callTool({ name: "claude_usage", arguments: { refresh: true } })) as CallToolResult;
+      assert.equal((refreshed.structuredContent as unknown as UsageBody).cached, false);
+      assert.equal(argvCalls().length, 2);
+    } finally {
+      await close();
+    }
+  });
+
+  it("reports windows null when the CLI can't read usage, and an error when /usage fails", async () => {
+    const unread = await connect({ FAKE_USAGE_MODE: "null" });
+    try {
+      const body = ((await unread.client.callTool({ name: "claude_usage", arguments: {} })) as CallToolResult)
+        .structuredContent as unknown as UsageBody;
+      assert.equal(body.parsed, true);
+      assert.equal(body.windows, null);
+    } finally {
+      await unread.close();
+    }
+    const failing = await connect({ FAKE_USAGE_MODE: "fail" });
+    try {
+      const result = (await failing.client.callTool({ name: "claude_usage", arguments: {} })) as CallToolResult;
+      assert.equal(errorBody(result).error.code, "CLI_EXIT_NONZERO");
+    } finally {
+      await failing.close();
+    }
+  });
+
+  it("with CLAUDE_MCP_USAGE_STOP_PERCENT, refuses create and local runs at the limit without starting them", async () => {
+    const localRoot = join(tmp, "usage-local");
+    mkdirSync(localRoot, { recursive: true });
+    const { client, argvCalls, close } = await connect({
+      CLAUDE_MCP_USAGE_STOP_PERCENT: "60",
+      CLAUDE_MCP_LOCAL_ROOTS: localRoot,
+    });
+    try {
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "over budget" },
+      })) as CallToolResult;
+      const error = errorBody(created).error;
+      assert.equal(error.code, "USAGE_LIMIT_NEAR");
+      assert.match(error.message, /68% of the session window/);
+      assert.match(error.message, /2026-11-02T22:10:00/);
+      const local = (await client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: localRoot, prompt: "over budget" },
+      })) as CallToolResult;
+      assert.equal(errorBody(local).error.code, "USAGE_LIMIT_NEAR");
+      assert.deepEqual(argvCalls(), [usageArgs], "only /usage ran, once, from the cache");
+      const usage = (await client.callTool({ name: "claude_usage", arguments: {} })) as CallToolResult;
+      const body = usage.structuredContent as unknown as UsageBody;
+      assert.equal(body.stop_percent, 60);
+      assert.equal(body.blocked_by?.kind, "session");
+    } finally {
+      await close();
+    }
+  });
+
+  it("lets work through below the limit, ignores scoped windows, and fails open when usage can't be read", async () => {
+    // Session 68% and weekly 10% are under 90; the scoped Cowork window at 99% only reports.
+    const under = await connect({ CLAUDE_MCP_USAGE_STOP_PERCENT: "90" });
+    try {
+      const created = (await under.client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "within budget" },
+      })) as CallToolResult;
+      assert.notEqual(created.isError, true);
+      assert.deepEqual(under.argvCalls()[1], ["--cloud=within budget"]);
+    } finally {
+      await under.close();
+    }
+    const unknown = await connect({ CLAUDE_MCP_USAGE_STOP_PERCENT: "50", FAKE_USAGE_MODE: "fail" });
+    try {
+      const created = (await unknown.client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "usage unknown" },
+      })) as CallToolResult;
+      assert.notEqual(created.isError, true);
+      assert.deepEqual(unknown.argvCalls()[1], ["--cloud=usage unknown"]);
+    } finally {
+      await unknown.close();
+    }
+  });
+
+  it("surfaces a local run's rate-limit event on the job", async () => {
+    const localRoot = join(tmp, "usage-rate");
+    mkdirSync(localRoot, { recursive: true });
+    const { client, close } = await connect({ CLAUDE_MCP_LOCAL_ROOTS: localRoot, FAKE_LOCAL_RATE_LIMIT: "allowed_warning" });
+    try {
+      const started = (await client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: localRoot, prompt: "near the limit" },
+      })) as CallToolResult;
+      const done = await pollLocal(client, (started.structuredContent as { job_id: string }).job_id, (job) => job.status === "done");
+      const body = (done.structuredContent as { local_job: { rate_limit: unknown } }).local_job;
+      assert.deepEqual(body.rate_limit, { status: "allowed_warning", resets_at: 1793743800, utilization: 0.91, type: null });
     } finally {
       await close();
     }

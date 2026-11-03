@@ -76,6 +76,11 @@ export interface Config {
    * of which runs shell commands without asking. Off by default.
    */
   localAllowShell: boolean;
+  /**
+   * Refuse new creates and local runs when the plan's session or weekly
+   * usage is at or above this percent. Null (the default) skips the check.
+   */
+  usageStopPercent: number | null;
   /** Streamable HTTP transport, or null for stdio (the default). */
   http: HttpConfig | null;
 }
@@ -99,6 +104,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const trustCwd = parseBooleanFlag("CLAUDE_MCP_TRUST_CWD", env.CLAUDE_MCP_TRUST_CWD);
   const localAllowShell = parseBooleanFlag("CLAUDE_MCP_LOCAL_ALLOW_SHELL", env.CLAUDE_MCP_LOCAL_ALLOW_SHELL);
+  const usageStopPercent = parsePercent("CLAUDE_MCP_USAGE_STOP_PERCENT", env.CLAUDE_MCP_USAGE_STOP_PERCENT);
   const pythonBin = (env.CLAUDE_MCP_PYTHON ?? "").trim() || "python3";
   const cwd = resolveCwd(env.CLAUDE_MCP_CWD);
   let repos: AllowEntry[];
@@ -128,6 +134,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     repoCache,
     localRoots,
     localAllowShell,
+    usageStopPercent,
     http: parseHttp(env),
   };
 }
@@ -172,6 +179,16 @@ function parseMilliseconds(name: string, raw: string | undefined): number | null
   if (value === "") return null;
   if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) {
     throw new ConfigError(`${name} must be a positive integer (milliseconds), got ${JSON.stringify(raw)}`);
+  }
+  return Number(value);
+}
+
+/** Unset or blank is null. A set value must be an integer from 1 to 100. */
+function parsePercent(name: string, raw: string | undefined): number | null {
+  const value = (raw ?? "").trim();
+  if (value === "") return null;
+  if (!/^[1-9][0-9]{0,2}$/.test(value) || Number(value) > 100) {
+    throw new ConfigError(`${name} must be an integer from 1 to 100, got ${JSON.stringify(raw)}`);
   }
   return Number(value);
 }

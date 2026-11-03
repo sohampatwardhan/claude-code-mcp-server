@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { authStatusArgv, createSessionArgv, localRunArgv, sendFollowupArgv, teleportArgv } from "../src/argv.js";
+import { authStatusArgv, createSessionArgv, localRunArgv, sendFollowupArgv, teleportArgv, usageArgv } from "../src/argv.js";
 import { ConfigError, DEFAULT_TIMEOUT_MS, loadConfig } from "../src/config.js";
 
 // realpath: on macOS tmpdir() is under /var, a symlink to /private/var, and git and
@@ -107,6 +107,18 @@ describe("local run argv", () => {
     ]);
   });
 
+  it("builds the fixed restricted /usage argv", () => {
+    assert.deepEqual(usageArgv(), [
+      "-p",
+      "--restricted",
+      "--strict-mcp-config",
+      "--output-format=stream-json",
+      "--verbose",
+      "--",
+      "/usage",
+    ]);
+  });
+
   it("refuses bypass, unknown tools, a bad model or resume id, and a bad turn limit", () => {
     const bad = [
       { permissionMode: "bypassPermissions" },
@@ -139,6 +151,7 @@ describe("loadConfig", () => {
       repoCache: resolve(homedir(), ".claude-mcp", "repos"),
       localRoots: [],
       localAllowShell: false,
+      usageStopPercent: null,
       http: null,
     });
   });
@@ -157,6 +170,7 @@ describe("loadConfig", () => {
         CLAUDE_MCP_REPO_CACHE: join(tmp, "repo-cache"),
         CLAUDE_MCP_LOCAL_ROOTS: ` ${tmp} , ${tmp}/ `,
         CLAUDE_MCP_LOCAL_ALLOW_SHELL: "1",
+        CLAUDE_MCP_USAGE_STOP_PERCENT: "90",
       }),
       {
         claudeBin: "/opt/claude",
@@ -173,6 +187,7 @@ describe("loadConfig", () => {
         repoCache: resolve(tmp, "repo-cache"),
         localRoots: [realpathSync(tmp)],
         localAllowShell: true,
+        usageStopPercent: 90,
         http: null,
       },
     );
@@ -217,6 +232,13 @@ describe("loadConfig", () => {
     for (const raw of ["relative/dir", join(tmp, "missing"), file, "/"]) {
       assert.throws(() => loadConfig({ CLAUDE_MCP_LOCAL_ROOTS: raw }), ConfigError, raw);
     }
+  });
+
+  it("rejects a CLAUDE_MCP_USAGE_STOP_PERCENT outside 1-100 or not an integer", () => {
+    for (const raw of ["0", "101", "9.5", "-5", "abc", "090"]) {
+      assert.throws(() => loadConfig({ CLAUDE_MCP_USAGE_STOP_PERCENT: raw }), ConfigError, raw);
+    }
+    assert.equal(loadConfig({ CLAUDE_MCP_USAGE_STOP_PERCENT: " 100 " }).usageStopPercent, 100);
   });
 
   it("turns on HTTP only with CLAUDE_MCP_HTTP_PORT, and then requires a strong CLAUDE_MCP_TOKEN", () => {

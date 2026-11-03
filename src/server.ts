@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -15,6 +16,7 @@ import {
   localRunArgv,
   sendFollowupArgv,
   teleportArgv,
+  usageArgv,
 } from "./argv.js";
 import { KILL_GRACE_MS, Scope, abortOnSignal, runInScope } from "./children.js";
 import { ENVIRONMENT_ID_PATTERN, type Config } from "./config.js";
@@ -33,6 +35,7 @@ import {
   parseFollowupOutput,
   parseGitStatusZ,
   parseTeleportOutput,
+  parseUsageReport,
   type ParsedCreate,
 } from "./parse.js";
 import { RunError, runCli, type RunResult, type Runner } from "./runner.js";
@@ -56,10 +59,40 @@ import {
   type CreatePlan,
   type GithubRepo,
 } from "./repos.js";
-import { claudeJsonPath, ensureWorkspaceTrusted, isTrustPrompt, resolveTrustProjectPath } from "./trust.js";
+import {
+  claudeJsonPath,
+  ensureWorkspaceTrusted,
+  isTrustMenuDrawn,
+  isTrustPrompt,
+  resolveTrustProjectPath,
+  trustAnswerKeys,
+} from "./trust.js";
 
 export const SERVER_NAME = "claude-code-mcp-server";
-export const SERVER_VERSION = "0.1.1";
+/** The package version, read from package.json so serverInfo matches the installed release. */
+export const SERVER_VERSION = readPackageVersion();
+
+/** Where calling agents report problems with this server. */
+export const ISSUES_URL = "https://github.com/sohampatwardhan/claude-code-mcp-server/issues";
+
+/**
+ * Guidance for calling agents on reporting problems with this server. Part
+ * of SERVER_INSTRUCTIONS; the README carries the same text for clients that
+ * don't pass server instructions to the model.
+ */
+export const ISSUE_REPORTING =
+  `Report problems with this server as GitHub issues at ${ISSUES_URL}, using your own GitHub access. ` +
+  "Report a tool result that looks wrong for what happened: an error code that doesn't fit, an unexpected " +
+  "CLI_EXIT_NONZERO or CLI_TIMEOUT, parsed false on output that did name a session, a job that never " +
+  "finishes, or a CLI prompt or message the server didn't recognise. Search open issues first and comment " +
+  "on a match instead of opening a duplicate. Title it `fix: <what went wrong>` (or `feat: <what is " +
+  "missing>`), and include the tool name and arguments, the error code and message, cli.exit_code and the " +
+  "relevant lines of cli.stdout and cli.stderr, the server version from serverInfo, the host OS, what you " +
+  "expected, and whether it happens again. Before posting, remove tokens, credentials, email addresses, " +
+  "and private repository names, paths and code; the issue tracker is public. Don't file issues for " +
+  "problems in the session's own work (failing tests, a wrong change), or for an error whose message " +
+  "already says what to do (CLI_NOT_FOUND, CLI_NOT_SIGNED_IN, WORKSPACE_NOT_TRUSTED, REPO_NOT_ALLOWED) " +
+  "unless doing that didn't help.";
 
 /** Server-level guidance sent to clients in the initialize result. */
 export const SERVER_INSTRUCTIONS =
@@ -74,6 +107,10 @@ export const SERVER_INSTRUCTIONS =
   "claude_run_local runs Claude Code on this machine in a checkout under CLAUDE_MCP_LOCAL_ROOTS, for work " +
   "that needs the local toolchain. It also returns a job_id: poll claude_get_session until local_job.status " +
   "is `done`, then read result, files and session_id; pass that session_id as `resume` to continue.\n\n" +
+  "claude_usage reports how much of the Claude plan's usage allowance is used, per window, with reset times. " +
+  "It costs nothing to call. Check it before starting several sessions, and when a window is close to 100% " +
+  "schedule new work after its resets_at instead of retrying into the limit. When the operator sets " +
+  "CLAUDE_MCP_USAGE_STOP_PERCENT, create and claude_run_local refuse with USAGE_LIMIT_NEAR above it.\n\n" +
   "Check results with claude_get_session, which reports the " +
   "branch a session pushed and any pull request it opened; the conversation and replies are only visible at " +
   "the session's session_url.\n\n" +
@@ -82,7 +119,8 @@ export const SERVER_INSTRUCTIONS =
   "as a patch: preferably `git format-patch origin/<base>..HEAD --stdout` against the base branch, otherwise " +
   "a full unified `git diff` that includes new files. Copy the patch from the session_url, apply it to your " +
   "own checkout (`git am`, or `git apply --3way`), run the tests, then commit, push and open or update the " +
-  "pull request yourself.";
+  "pull request yourself.\n\n" +
+  ISSUE_REPORTING;
 
 /** Below Linux's per-argument limit (MAX_ARG_STRLEN, 128 KiB). */
 const MAX_TEXT_LENGTH = 100_000;
@@ -95,6 +133,14 @@ const CREATE_WAIT_MS = 2_000;
 const OUTPUT_TAIL_CHARS = 4_000;
 /** Raw CLI output kept per job, to bound memory. Mirrors the pty cap. */
 const MAX_JOB_OUTPUT_CHARS = 4 * 1024 * 1024;
+/** How long a signed-in `claude auth status` result is trusted before create and local runs check again. */
+const AUTH_OK_CACHE_MS = 60_000;
+/** Most time the sign-in preflight may take before the run goes ahead without it. */
+const AUTH_PREFLIGHT_TIMEOUT_MS = 10_000;
+/** How long a plan-usage reading is reused. */
+const USAGE_CACHE_MS = 60_000;
+/** Usage windows that block new work at CLAUDE_MCP_USAGE_STOP_PERCENT; scoped weekly rows only report. */
+const BLOCKING_USAGE_KINDS = new Set(["session", "weekly_all"]);
 /** Changed files a local run reports. */
 const MAX_LOCAL_FILES = 1_000;
 
@@ -107,6 +153,7 @@ export const TOOL_NAMES = [
   "claude_get_session",
   "claude_cancel_session",
   "claude_run_local",
+  "claude_usage",
   "claude_auth_status",
 ] as const;
 
@@ -124,7 +171,8 @@ export type ErrorCode =
   | "CLI_NOT_SIGNED_IN"
   | "JOB_NOT_FOUND"
   | "LOCAL_RUNS_DISABLED"
-  | "LOCAL_SHELL_DISABLED";
+  | "LOCAL_SHELL_DISABLED"
+  | "USAGE_LIMIT_NEAR";
 
 // ---- schemas -------------------------------------------------------------
 
@@ -272,6 +320,12 @@ const localInput = z
   })
   .strict();
 
+const usageInput = z
+  .object({
+    refresh: z.boolean().optional().describe("Read usage now instead of reusing a reading up to 60 s old."),
+  })
+  .strict();
+
 const authInput = z.object({}).strict();
 
 const cliOutput = z
@@ -326,6 +380,47 @@ const createOutput = z
   })
   .strict();
 
+const usageWindow = z
+  .object({
+    kind: z.string().describe("Meter kind: session (the rolling session window), weekly_all, weekly_scoped, ..."),
+    group: z.string().nullable(),
+    percent: z.number().describe("Share of the window used, 0-100."),
+    resets_at: z.string().nullable().describe("ISO 8601 time the window resets."),
+    severity: z.string().nullable().describe("normal, warning or critical, as the server reports it."),
+    is_active: z.boolean().describe("True on the window Claude shows as the headline meter."),
+    scope: z.string().nullable().describe("Model or surface a scoped window applies to, by display name."),
+  })
+  .strict();
+
+const usageOutput = z
+  .object({
+    checked_at: z.string().describe("When this reading was taken (ISO 8601)."),
+    cached: z.boolean().describe("True when this reading was reused from an earlier call within 60 s."),
+    parsed: z.boolean().describe("True when the CLI's usage report was read."),
+    windows: z
+      .array(usageWindow)
+      .nullable()
+      .describe("Usage per window. Null when the CLI can't read the plan's usage (for example, API-key auth)."),
+    extra_usage: z
+      .object({
+        is_enabled: z.boolean(),
+        monthly_limit: z.number().nullable().describe("In minor units of currency (cents for USD)."),
+        used_credits: z.number().nullable(),
+        utilization: z.number().nullable(),
+        currency: z.string().nullable(),
+      })
+      .strict()
+      .nullable()
+      .describe("Usage-credit spend, when the plan has usage credits."),
+    stop_percent: z.number().int().nullable().describe("CLAUDE_MCP_USAGE_STOP_PERCENT, or null when unset."),
+    blocked_by: usageWindow
+      .nullable()
+      .describe("The session or weekly_all window at or above stop_percent, which makes new work fail with USAGE_LIMIT_NEAR."),
+    args: z.array(z.string()),
+    cli: cliOutput.describe("exit_code and the tail of stderr. stdout is empty when the report was read."),
+  })
+  .strict();
+
 const localOutput = z
   .object({
     job_id: z.string().describe("Background job for this run. Pass it to claude_get_session until status is done."),
@@ -360,6 +455,16 @@ const localOutput = z
       .strict()
       .nullable(),
     permission_denials: z.array(z.string()).describe("Tools whose calls were denied, by name."),
+    rate_limit: z
+      .object({
+        status: z.string().nullable().describe("allowed, allowed_warning (approaching the limit) or rejected (limit hit)."),
+        resets_at: z.number().nullable().describe("Unix seconds when the window resets."),
+        utilization: z.number().nullable().describe("Fraction of the window used, 0-1."),
+        type: z.string().nullable().describe("Which window, such as five_hour or seven_day, when reported."),
+      })
+      .strict()
+      .nullable()
+      .describe("The latest rate-limit event the run reported, or null if none."),
     errors: z.array(z.string()).describe("Errors the CLI reported on an error result."),
     files: z
       .array(
@@ -421,6 +526,7 @@ const cancelOutput = z
 
 type CreateBody = z.infer<typeof createOutput>;
 type LocalBody = z.infer<typeof localOutput>;
+type UsageBody = z.infer<typeof usageOutput>;
 
 /** Fixed fields of one claude_run_local job. */
 interface LocalJob {
@@ -474,7 +580,8 @@ const authOutput = z
 // ---- server --------------------------------------------------------------
 
 /**
- * State one server process keeps across MCP connections: the job stores.
+ * State one server process keeps across MCP connections: the job stores and
+ * the sign-in and usage caches.
  * Stdio has one connection; the HTTP transport builds a server per request
  * and passes the same state, so a job started in one request can be polled
  * or cancelled from another.
@@ -482,15 +589,132 @@ const authOutput = z
 export interface ServerState {
   jobs: JobStore<CreateJob>;
   localJobs: JobStore<LocalJob>;
+  /** When the sign-in preflight last saw a signed-in CLI. */
+  authOkAt: number | null;
+  /** The latest plan-usage reading, and a run in flight that concurrent callers share. */
+  usageCache: { at: number; body: UsageBody } | null;
+  usageInFlight: Promise<UsageBody | CallToolResult> | null;
 }
 
 export function createServerState(): ServerState {
-  return { jobs: new JobStore<CreateJob>(), localJobs: new JobStore<LocalJob>() };
+  return {
+    jobs: new JobStore<CreateJob>(),
+    localJobs: new JobStore<LocalJob>(),
+    authOkAt: null,
+    usageCache: null,
+    usageInFlight: null,
+  };
 }
 
 export function createServer(config: Config, runner: Runner = runCli, state: ServerState = createServerState()): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: SERVER_INSTRUCTIONS });
   const { jobs, localJobs } = state;
+
+  /**
+   * Before create or a local run starts anything else, check the sign-in
+   * with `claude auth status`: a signed-out CLI fails in about a second with
+   * CLI_NOT_SIGNED_IN instead of partway through. A missing CLI fails with
+   * CLI_NOT_FOUND. Anything else this check can't read lets the run go
+   * ahead, so the CLI's own error still surfaces.
+   */
+  async function authPreflight(): Promise<CallToolResult | null> {
+    if (state.authOkAt !== null && Date.now() - state.authOkAt < AUTH_OK_CACHE_MS) return null;
+    const args = authStatusArgv();
+    let result: RunResult;
+    try {
+      result = await runner(config.claudeBin, args, Math.min(config.timeoutMs, AUTH_PREFLIGHT_TIMEOUT_MS), config.cwd);
+    } catch (err) {
+      if (err instanceof RunError && err.code === "CLI_NOT_FOUND") return toolError(err.code, err.message, args);
+      return null;
+    }
+    if (result.timedOut) return null;
+    let status;
+    try {
+      status = parseAuthStatus(result.stdout);
+    } catch {
+      return null;
+    }
+    if (status.loggedIn) {
+      state.authOkAt = Date.now();
+      return null;
+    }
+    state.authOkAt = null;
+    const how = status.authMethod === null ? "" : ` (auth method: ${status.authMethod})`;
+    return toolError(
+      "CLI_NOT_SIGNED_IN",
+      signInMessage(`claude auth status reports loggedIn false${how}`) +
+        " On a headless host, run `claude auth login` there. On macOS over SSH, the login keychain may be locked; unlock it or run the server in the logged-in user's session.",
+      args,
+      result,
+    );
+  }
+
+  /**
+   * The plan's usage, from print-mode `/usage` (no model call). Readings are
+   * reused for USAGE_CACHE_MS, and concurrent callers share one run.
+   */
+  function readUsage(refresh: boolean): Promise<UsageBody | CallToolResult> {
+    if (!refresh && state.usageCache !== null && Date.now() - state.usageCache.at < USAGE_CACHE_MS) {
+      return Promise.resolve({ ...state.usageCache.body, cached: true });
+    }
+    state.usageInFlight ??= fetchUsage().finally(() => {
+      state.usageInFlight = null;
+    });
+    return state.usageInFlight;
+  }
+
+  async function fetchUsage(): Promise<UsageBody | CallToolResult> {
+    const args = usageArgv();
+    const timeoutMs = Math.min(config.timeoutMs, 60_000);
+    // A directory this server owns: restricted mode confines file tools to it, and /usage reads no files.
+    await mkdir(config.repoCache, { recursive: true });
+    let result: RunResult;
+    try {
+      result = await runner(config.claudeBin, args, timeoutMs, config.repoCache);
+    } catch (err) {
+      if (err instanceof RunError) return toolError(err.code, err.message, args);
+      throw err;
+    }
+    const usage = parseUsageReport(result.stdout);
+    const shown = { ...result, stdout: usage.parsed ? "" : tail(result.stdout), stderr: tail(result.stderr) };
+    if (result.timedOut) return toolError("CLI_TIMEOUT", `claude timed out after ${timeoutMs} ms`, args, shown);
+    if (result.exitCode !== 0) return exitError(shown, args);
+    const stop = config.usageStopPercent;
+    const body: UsageBody = {
+      checked_at: new Date().toISOString(),
+      cached: false,
+      parsed: usage.parsed,
+      windows: usage.windows,
+      extra_usage: usage.extra_usage,
+      stop_percent: stop,
+      blocked_by:
+        stop === null
+          ? null
+          : (usage.windows ?? []).find((window) => BLOCKING_USAGE_KINDS.has(window.kind) && window.percent >= stop) ?? null,
+      args,
+      cli: { exit_code: result.exitCode, stdout: shown.stdout, stderr: cleanTerminalText(shown.stderr) },
+    };
+    if (usage.parsed) state.usageCache = { at: Date.now(), body };
+    return body;
+  }
+
+  /**
+   * With CLAUDE_MCP_USAGE_STOP_PERCENT set, refuse new work when a session or
+   * weekly window is at or above it. A budget guard, not a security control:
+   * when usage can't be read, work goes ahead.
+   */
+  async function usageGate(): Promise<CallToolResult | null> {
+    if (config.usageStopPercent === null) return null;
+    const usage = await readUsage(false);
+    if (!isUsageBody(usage) || usage.blocked_by === null) return null;
+    const window = usage.blocked_by;
+    const resets = window.resets_at === null ? "" : ` It resets at ${window.resets_at}.`;
+    return toolError(
+      "USAGE_LIMIT_NEAR",
+      `Claude plan usage is at ${window.percent}% of the ${window.kind} window, at or above CLAUDE_MCP_USAGE_STOP_PERCENT (${usage.stop_percent}%).${resets} Start new work after the reset; claude_usage shows every window.`,
+      usage.args,
+    );
+  }
 
   /** Runs the CLI; returns the result on exit 0, otherwise a tool error. */
   async function run(args: string[]): Promise<RunResult | CallToolResult> {
@@ -531,7 +755,11 @@ export function createServer(config: Config, runner: Runner = runCli, state: Ser
         onProgress,
         onOutput: (output) => {
           if (!isTrustPrompt(output)) return "wait";
-          return config.trustCwd ? "accept" : "refuse";
+          if (!config.trustCwd) return "refuse";
+          // Never press Enter blind: wait for the menu to be drawn, then refuse if its selection can't be read.
+          const keys = trustAnswerKeys(output);
+          if (keys !== null) return { keys };
+          return isTrustMenuDrawn(output) ? "refuse" : "wait";
         },
       });
     } catch (err) {
@@ -539,7 +767,7 @@ export function createServer(config: Config, runner: Runner = runCli, state: Ser
       throw err;
     }
     if (result.trustPrompt === "refused" || (result.trustPrompt !== "accepted" && isTrustPrompt(result.stdout))) {
-      return toolError("WORKSPACE_NOT_TRUSTED", trustMessage(projectPath), args, result);
+      return toolError("WORKSPACE_NOT_TRUSTED", trustMessage(projectPath, config.trustCwd), args, result);
     }
     if (result.timedOut) {
       return toolError("CLI_TIMEOUT", `claude timed out after ${limits.timeoutMs} ms`, args, result);
@@ -600,6 +828,8 @@ export function createServer(config: Config, runner: Runner = runCli, state: Ser
         if (err instanceof RepoPrepareError) return toolError("REPO_PREPARE_FAILED", err.message, []);
         throw err;
       }
+      const blocked = await usageGate();
+      if (blocked !== null) return blocked;
       const details: CreateJob = {
         args: createSessionArgv(description, environmentId),
         environmentId,
@@ -630,6 +860,8 @@ export function createServer(config: Config, runner: Runner = runCli, state: Ser
 
   /** Clone (for GitHub), then run `claude --cloud`. Settles with the final tool result. */
   async function runCreateJob(job: Job<CreateJob>, plan: CreatePlan): Promise<CallToolResult> {
+    const signedOut = await authPreflight();
+    if (signedOut !== null) return signedOut;
     try {
       if (plan.kind === "github") {
         const github = plan.github;
@@ -1050,6 +1282,8 @@ export function createServer(config: Config, runner: Runner = runCli, state: Ser
         if (err instanceof LocalPathError) return toolError("REPO_NOT_ALLOWED", err.message, []);
         throw err;
       }
+      const blocked = await usageGate();
+      if (blocked !== null) return blocked;
       const permissionMode = permission_mode ?? "dontAsk";
       const details: LocalJob = {
         args: localRunArgv({
@@ -1087,6 +1321,8 @@ export function createServer(config: Config, runner: Runner = runCli, state: Ser
   /** Run `claude -p` and read its result. Settles with the final tool result. */
   async function runLocalJob(job: Job<LocalJob>): Promise<CallToolResult> {
     const { args, cwd, timeoutMs, parser } = job.details;
+    const signedOut = await authPreflight();
+    if (signedOut !== null) return signedOut;
     const before = await readGitStatus(cwd, timeoutMs);
     let result: RunResult;
     try {
@@ -1149,6 +1385,7 @@ export function createServer(config: Config, runner: Runner = runCli, state: Ser
       total_cost_usd: final?.total_cost_usd ?? null,
       usage: final?.usage ?? null,
       permission_denials: final?.permission_denials ?? [],
+      rate_limit: parser.rateLimit,
       errors: final?.errors ?? [],
       files,
       args,
@@ -1165,6 +1402,27 @@ export function createServer(config: Config, runner: Runner = runCli, state: Ser
     const status = job.status === "cancelled" ? "cancelled" : job.status === "running" ? "running" : "starting";
     return localBody(job, status, null, { exit_code: null, stdout: "", stderr: "" });
   }
+
+  server.registerTool(
+    "claude_usage",
+    {
+      title: "Claude plan usage",
+      description:
+        "Report how much of the Claude plan's usage allowance is used: each window (the rolling session window, " +
+        "weekly windows, model- or surface-scoped ones) with its percent, reset time and severity, plus " +
+        "usage-credit spend. Runs print-mode `claude -p --restricted -- /usage`, a local command that makes no " +
+        "model call and costs nothing; readings are reused for 60 s unless `refresh` is true. When " +
+        "CLAUDE_MCP_USAGE_STOP_PERCENT is set, `blocked_by` names the window that makes create and " +
+        "claude_run_local fail with USAGE_LIMIT_NEAR. `windows` is null when the CLI can't read plan usage.",
+      inputSchema: usageInput,
+      outputSchema: usageOutput,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ refresh }) => {
+      const usage = await readUsage(refresh === true);
+      return isUsageBody(usage) ? ok(usage) : usage;
+    },
+  );
 
   server.registerTool(
     "claude_auth_status",
@@ -1217,6 +1475,10 @@ function isLocalBody(value: LocalBody | CallToolResult): value is LocalBody {
   return "job_id" in value;
 }
 
+function isUsageBody(value: UsageBody | CallToolResult): value is UsageBody {
+  return "checked_at" in value;
+}
+
 /** claude_get_session fields that don't apply to a job read. */
 function emptySession() {
   return {
@@ -1267,8 +1529,16 @@ function changedFiles(before: string | null, after: string | null): LocalBody["f
 
 // ---- result helpers ------------------------------------------------------
 
-function trustMessage(projectPath: string): string {
+function trustMessage(projectPath: string, trustCwd: boolean): string {
   const shown = JSON.stringify(projectPath);
+  if (trustCwd) {
+    return (
+      `Claude Code asked to trust ${projectPath} before creating a cloud session. CLAUDE_MCP_TRUST_CWD is set, ` +
+      `but this server could not read which option the dialog had selected, so it did not answer it. ` +
+      `Trust the folder by accepting the dialog in an interactive claude session there, or set ` +
+      `projects[${shown}].hasTrustDialogAccepted to true in ~/.claude.json, then try again.`
+    );
+  }
   return (
     `Claude Code asked to trust ${projectPath} before creating a cloud session. ` +
     `Set CLAUDE_MCP_TRUST_CWD=1 to let this server accept that dialog for the directory this session is created from ` +
@@ -1324,4 +1594,15 @@ function ok(structured: Record<string, unknown>): CallToolResult {
 function toolError(code: ErrorCode, message: string, args: string[], result?: RunResult): CallToolResult {
   const body = { error: { code, message, args, cli: result ? cli(result) : null } };
   return { isError: true, content: [{ type: "text", text: JSON.stringify(body) }] };
+}
+
+function readPackageVersion(): string {
+  try {
+    // dist/src/server.js -> package.json at the package root (npm always ships it).
+    const pkg: unknown = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+    const version = typeof pkg === "object" && pkg !== null ? (pkg as { version?: unknown }).version : undefined;
+    return typeof version === "string" && version !== "" ? version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
 }

@@ -2,8 +2,20 @@
 
 ## Unreleased
 
+### Fixed
+
+- Create no longer hangs for the whole timeout at Claude Code 2.1.316's workspace-trust dialog ("Quick safety check: Is this a project you created or one you trust?"). The dialog draws each word with a cursor move instead of spaces, so the server didn't recognise it. CLI text is now rendered with those moves as spaces, both wordings are recognised, and the call fails with `WORKSPACE_NOT_TRUSTED` in under a second (#21).
+- With `CLAUDE_MCP_TRUST_CWD`, the dialog is answered by moving to "Yes, I trust this folder" before pressing Enter. Current versions select "No, exit" first, so Enter alone would have exited. An unreadable selection is refused instead of answered (#21).
+- Create and `claude_run_local` check `claude auth status` first and fail in about a second with `CLI_NOT_SIGNED_IN` when the CLI is signed out, without starting a clone or session. "Cloud sessions need a claude.ai sign-in" is now recognised as a sign-in error (#22).
+
+### Added
+
+- New `claude_usage` tool reports the Claude plan's usage allowance (session and weekly windows with percent and reset time, plus usage-credit spend) from print-mode `/usage`, which runs no model turn and costs nothing. Readings are cached for 60 s. `CLAUDE_MCP_USAGE_STOP_PERCENT` makes create and `claude_run_local` refuse with the new `USAGE_LIMIT_NEAR` error near the limit. Local runs report the CLI's rate-limit events in `rate_limit`.
 - `claude_create_cloud_session` runs in the background and returns within about 2 seconds, so a slow clone or `claude --cloud` on a large repository no longer hits the MCP client's request timeout (`-32001`). The output gains `job_id`, `status` (`cloning`, `starting`, `running`, `done`) and `elapsed_ms`. When `status` is not `done`, poll `claude_get_session` with the `job_id`.
 - `claude_get_session` accepts a `job_id` and returns that create's progress or result in `job`, or its error. `session_id`, `repo` and `cli` in its output are now nullable.
+- Server instructions ask calling agents (Muse, Grok Bot and others) to report problems with the server as GitHub issues on this repository: what to include, what to strip, and what not to report. The README has the same text for clients that don't pass server instructions on.
+- `serverInfo.version` now reports the package version (it said `0.1.1`).
+- The README, package description and AGENTS.md name ChatGPT Dots and Claude Duet alongside Muse and Grok Bot as orchestrators, and describe the planned MCP orchestration suite (one server per agent tool, sharing the #28 job model).
 - New `JOB_NOT_FOUND` error for job ids this server doesn't hold (jobs are in memory only).
 - New `claude_cancel_session` tool stops a create job that is still running: SIGTERM to every process it started, then SIGKILL 5 s later. It reports `cancelled` and `stopped`. It doesn't stop a cloud session that was already created. Cancelled jobs report `status: "cancelled"`.
 - Opt-in Streamable HTTP transport, so an orchestrator on another machine can reach the server (#15). Set `CLAUDE_MCP_HTTP_PORT` (with `CLAUDE_MCP_HTTP_HOST`, default `127.0.0.1`) and the required `CLAUDE_MCP_TOKEN`. Every request needs `Authorization: Bearer <token>` (constant-time check, 401 otherwise) and an allowed `Host` / `Origin` (DNS-rebinding protection, extend it with `CLAUDE_MCP_HTTP_ALLOWED_HOSTS`). Stateless `POST /mcp` with jobs shared across requests. Signals stop every child. The README covers `tailscale serve` and `launchd`. Stdio stays the default.
