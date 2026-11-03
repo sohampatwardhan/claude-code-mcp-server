@@ -152,6 +152,7 @@ describe("loadConfig", () => {
       localRoots: [],
       localAllowShell: false,
       usageStopPercent: null,
+      http: null,
     });
   });
 
@@ -187,6 +188,7 @@ describe("loadConfig", () => {
         localRoots: [realpathSync(tmp)],
         localAllowShell: true,
         usageStopPercent: 90,
+        http: null,
       },
     );
   });
@@ -237,6 +239,52 @@ describe("loadConfig", () => {
       assert.throws(() => loadConfig({ CLAUDE_MCP_USAGE_STOP_PERCENT: raw }), ConfigError, raw);
     }
     assert.equal(loadConfig({ CLAUDE_MCP_USAGE_STOP_PERCENT: " 100 " }).usageStopPercent, 100);
+  });
+
+  it("turns on HTTP only with CLAUDE_MCP_HTTP_PORT, and then requires a strong CLAUDE_MCP_TOKEN", () => {
+    const token = "t".repeat(32);
+    assert.equal(loadConfig({ CLAUDE_MCP_TOKEN: token }).http, null, "a token alone does not start HTTP");
+    assert.deepEqual(loadConfig({ CLAUDE_MCP_HTTP_PORT: "8787", CLAUDE_MCP_TOKEN: token }).http, {
+      host: "127.0.0.1",
+      port: 8787,
+      token,
+      allowedHosts: ["localhost", "127.0.0.1", "[::1]"],
+    });
+    assert.deepEqual(
+      loadConfig({
+        CLAUDE_MCP_HTTP_PORT: "0",
+        CLAUDE_MCP_HTTP_HOST: "::1",
+        CLAUDE_MCP_TOKEN: token,
+        CLAUDE_MCP_HTTP_ALLOWED_HOSTS: " MyMac.tail1234.ts.net , [fd7a:115c:a1e0::1] ",
+      }).http?.allowedHosts,
+      ["localhost", "127.0.0.1", "[::1]", "mymac.tail1234.ts.net", "[fd7a:115c:a1e0::1]"],
+    );
+    assert.deepEqual(
+      loadConfig({ CLAUDE_MCP_HTTP_PORT: "8787", CLAUDE_MCP_HTTP_HOST: "0.0.0.0", CLAUDE_MCP_TOKEN: token }).http?.allowedHosts,
+      ["localhost", "127.0.0.1", "[::1]"],
+      "a wildcard bind address is not an allowed Host",
+    );
+  });
+
+  it("refuses HTTP without a token, with a weak token, or with a bad port, host or allowed host, never echoing the token", () => {
+    const secret = "s3cr3t-value-that-must-not-leak";
+    const cases: Record<string, string>[] = [
+      { CLAUDE_MCP_HTTP_PORT: "8787" },
+      { CLAUDE_MCP_HTTP_PORT: "8787", CLAUDE_MCP_TOKEN: secret },
+      { CLAUDE_MCP_HTTP_PORT: "8787", CLAUDE_MCP_TOKEN: `${"x".repeat(32)} ${secret}` },
+      { CLAUDE_MCP_HTTP_PORT: "65536", CLAUDE_MCP_TOKEN: "x".repeat(32) },
+      { CLAUDE_MCP_HTTP_PORT: "08787", CLAUDE_MCP_TOKEN: "x".repeat(32) },
+      { CLAUDE_MCP_HTTP_PORT: "8787", CLAUDE_MCP_TOKEN: "x".repeat(32), CLAUDE_MCP_HTTP_HOST: "http://host" },
+      { CLAUDE_MCP_HTTP_PORT: "8787", CLAUDE_MCP_TOKEN: "x".repeat(32), CLAUDE_MCP_HTTP_ALLOWED_HOSTS: "evil.example:443" },
+      { CLAUDE_MCP_HTTP_PORT: "8787", CLAUDE_MCP_TOKEN: "x".repeat(32), CLAUDE_MCP_HTTP_ALLOWED_HOSTS: "https://evil.example" },
+    ];
+    for (const env of cases) {
+      assert.throws(
+        () => loadConfig(env),
+        (err: unknown) => err instanceof ConfigError && !err.message.includes(secret),
+        JSON.stringify(Object.keys(env)),
+      );
+    }
   });
 
   it("treats an explicit false trust flag as off", () => {

@@ -579,11 +579,36 @@ const authOutput = z
 
 // ---- server --------------------------------------------------------------
 
-export function createServer(config: Config, runner: Runner = runCli): McpServer {
+/**
+ * State one server process keeps across MCP connections: the job stores and
+ * the sign-in and usage caches.
+ * Stdio has one connection; the HTTP transport builds a server per request
+ * and passes the same state, so a job started in one request can be polled
+ * or cancelled from another.
+ */
+export interface ServerState {
+  jobs: JobStore<CreateJob>;
+  localJobs: JobStore<LocalJob>;
+  /** When the sign-in preflight last saw a signed-in CLI. */
+  authOkAt: number | null;
+  /** The latest plan-usage reading, and a run in flight that concurrent callers share. */
+  usageCache: { at: number; body: UsageBody } | null;
+  usageInFlight: Promise<UsageBody | CallToolResult> | null;
+}
+
+export function createServerState(): ServerState {
+  return {
+    jobs: new JobStore<CreateJob>(),
+    localJobs: new JobStore<LocalJob>(),
+    authOkAt: null,
+    usageCache: null,
+    usageInFlight: null,
+  };
+}
+
+export function createServer(config: Config, runner: Runner = runCli, state: ServerState = createServerState()): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: SERVER_INSTRUCTIONS });
-  const jobs = new JobStore<CreateJob>();
-  const localJobs = new JobStore<LocalJob>();
-  let authOkAt: number | null = null;
+  const { jobs, localJobs } = state;
 
   /**
    * Before create or a local run starts anything else, check the sign-in
@@ -593,7 +618,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
    * ahead, so the CLI's own error still surfaces.
    */
   async function authPreflight(): Promise<CallToolResult | null> {
-    if (authOkAt !== null && Date.now() - authOkAt < AUTH_OK_CACHE_MS) return null;
+    if (state.authOkAt !== null && Date.now() - state.authOkAt < AUTH_OK_CACHE_MS) return null;
     const args = authStatusArgv();
     let result: RunResult;
     try {
@@ -610,10 +635,10 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       return null;
     }
     if (status.loggedIn) {
-      authOkAt = Date.now();
+      state.authOkAt = Date.now();
       return null;
     }
-    authOkAt = null;
+    state.authOkAt = null;
     const how = status.authMethod === null ? "" : ` (auth method: ${status.authMethod})`;
     return toolError(
       "CLI_NOT_SIGNED_IN",
@@ -624,21 +649,18 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
     );
   }
 
-  let usageCache: { at: number; body: UsageBody } | null = null;
-  let usageInFlight: Promise<UsageBody | CallToolResult> | null = null;
-
   /**
    * The plan's usage, from print-mode `/usage` (no model call). Readings are
    * reused for USAGE_CACHE_MS, and concurrent callers share one run.
    */
   function readUsage(refresh: boolean): Promise<UsageBody | CallToolResult> {
-    if (!refresh && usageCache !== null && Date.now() - usageCache.at < USAGE_CACHE_MS) {
-      return Promise.resolve({ ...usageCache.body, cached: true });
+    if (!refresh && state.usageCache !== null && Date.now() - state.usageCache.at < USAGE_CACHE_MS) {
+      return Promise.resolve({ ...state.usageCache.body, cached: true });
     }
-    usageInFlight ??= fetchUsage().finally(() => {
-      usageInFlight = null;
+    state.usageInFlight ??= fetchUsage().finally(() => {
+      state.usageInFlight = null;
     });
-    return usageInFlight;
+    return state.usageInFlight;
   }
 
   async function fetchUsage(): Promise<UsageBody | CallToolResult> {
@@ -672,7 +694,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       args,
       cli: { exit_code: result.exitCode, stdout: shown.stdout, stderr: cleanTerminalText(shown.stderr) },
     };
-    if (usage.parsed) usageCache = { at: Date.now(), body };
+    if (usage.parsed) state.usageCache = { at: Date.now(), body };
     return body;
   }
 
