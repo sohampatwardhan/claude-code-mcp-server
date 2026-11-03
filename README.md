@@ -163,20 +163,24 @@ Teleport has to run in a checkout of the same repository (not a fork) with a cle
 
 ### Workspace trust
 
-`claude --cloud <description>` requires an interactive terminal. On a pseudo-terminal the CLI then stops at "Do you trust this folder?" until someone answers, because accepting trust lets that folder's project hooks, allow rules, and `.mcp.json` servers run.
+`claude --cloud <description>` requires an interactive terminal. On a pseudo-terminal the CLI then stops at its workspace-trust dialog until someone answers. Older versions asked "Do you trust the files in this folder?"; Claude Code 2.1.316 asks "Quick safety check: Is this a project you created or one you trust?" with "No, exit" selected above "Yes, I trust this folder". The server recognises both wordings. It renders the CLI's cursor moves as the spaces they draw, so a dialog built from positioned words still matches. Trust matters because accepting it lets that folder's project hooks, allow rules, and `.mcp.json` servers run.
 
 This server does not answer that dialog on its own. Either:
 
 - Trust the folder yourself: run `claude` once in that directory and accept the dialog, or set `projects["<path>"].hasTrustDialogAccepted` to `true` in `~/.claude.json`. `<path>` is the main git checkout when the selected directory is a repository or worktree, and the directory itself otherwise. The selected directory is `repo` when the call sets one, and `CLAUDE_MCP_CWD` otherwise (the process working directory when that variable is unset). Claude Code documents this key under [project allow rules and workspace trust](https://code.claude.com/docs/en/permissions#project-allow-rules-and-workspace-trust).
-- Or set `CLAUDE_MCP_TRUST_CWD=1`. Create then writes that same key for the one directory above and, if the dialog still appears, sends Enter once. The opt-in covers that one directory. Create still runs with the CLI's normal permission prompts.
+- Or set `CLAUDE_MCP_TRUST_CWD=1`. Create then writes that same key for the one directory above and, if the dialog still appears, answers it once. It reads which option is selected (`❯`) and moves to "Yes, I trust this folder" with the arrow keys before pressing Enter, since Enter alone would choose "No, exit" on current versions. If the menu's selection can't be read, it doesn't answer and fails with `WORKSPACE_NOT_TRUSTED`. The opt-in covers that one directory. Create still runs with the CLI's normal permission prompts.
 
 The trust edit holds `~/.claude.json.lock` (exclusive create, treated as stale after 5 seconds) so two of these servers do not interleave. Inside the lock it re-reads `~/.claude.json` immediately before an atomic rename, skips the write when `hasTrustDialogAccepted` is already true, and retries the merge when the file changed since the first read so other fields are kept.
 
 Claude Code does not take that lock. A Claude process that saves `~/.claude.json` after this server's second read can overwrite the trust flag, and a save that lands between that read and the rename can itself be overwritten. If the dialog comes back, set the flag again while no Claude process is writing the file.
 
-A description that merely contains the words "Do you trust this folder?" is not treated as the dialog. The `Created cloud session:` title line is ignored when the server looks for the prompt.
+Without the opt-in, the dialog fails the call with `WORKSPACE_NOT_TRUSTED` as soon as it is drawn (under a second on Claude Code 2.1.316), never after the full timeout. A description that merely contains the words "Do you trust this folder?" is not treated as the dialog. The `Created cloud session:` title line is ignored when the server looks for the prompt.
 
-Trust is stored in `~/.claude.json` in the home directory (not under `~/.claude/`). When `~/.claude.json` is missing or is not a JSON object, the opt-in leaves it unchanged and answers the dialog on the pty instead. Claude Code treats the home directory itself as trusted for the current session only, so a server whose `CLAUDE_MCP_CWD` is `$HOME` still needs the opt-in for the pty to press Enter.
+Trust is stored in `~/.claude.json` in the home directory (not under `~/.claude/`). When `~/.claude.json` is missing or is not a JSON object, the opt-in leaves it unchanged and answers the dialog on the pty instead. Claude Code treats the home directory itself as trusted for the current session only, so a server whose `CLAUDE_MCP_CWD` is `$HOME` still needs the opt-in for the pty to answer the dialog.
+
+### Sign-in check
+
+Before create and `claude_run_local` start anything, the server runs `claude auth status` in `CLAUDE_MCP_CWD`, which makes no model call. If it reports `"loggedIn": false`, the call fails in about a second with `CLI_NOT_SIGNED_IN`, naming the auth method the CLI reports and the remedy (`claude auth login` on the server's host; on macOS over SSH the login keychain may be locked). No clone, `--cloud` or `-p` process starts. A signed-in result is reused for 60 seconds. If `auth status` can't be read, times out (10 seconds), or fails for another reason, the run goes ahead and the CLI's own error still surfaces. A missing CLI fails with `CLI_NOT_FOUND`.
 
 ## Tool reference
 
@@ -512,7 +516,7 @@ Failures come back as MCP tool errors (`isError: true`). The text content block 
 | `CLI_EXIT_NONZERO` | The CLI exited non-zero or was killed by a signal. `message` includes the stderr text. |
 | `CLI_TIMEOUT` | The CLI ran longer than `CLAUDE_MCP_TIMEOUT_MS` (or create's `timeout_s`), or `claude --cloud` printed nothing for `idle_timeout_s` / `CLAUDE_MCP_IDLE_TIMEOUT_MS`. |
 | `CLI_NOT_FOUND` | `CLAUDE_BIN` could not be found. `message` names the install command (`npm install -g @anthropic-ai/claude-code`) and the sign-in step. `cli` is `null` on the pipe path. |
-| `CLI_NOT_SIGNED_IN` | The CLI exited non-zero with output that reads like a missing or expired login (for example `Invalid API key · Please run /login`, or `claude auth status` printing `"loggedIn": false`). `message` says to sign in with `claude` first. |
+| `CLI_NOT_SIGNED_IN` | The sign-in check before create or a local run found `"loggedIn": false`, or the CLI exited non-zero with output that reads like a missing or expired login (for example `Invalid API key · Please run /login`, or `Cloud sessions need a claude.ai sign-in`). `message` says to sign in with `claude` first. |
 | `CLI_SPAWN_FAILED` | The process could not be started for another reason. `cli` is `null`. |
 | `OUTPUT_PARSE_FAILED` | `claude auth status` did not print JSON with a boolean `loggedIn`. |
 | `PTY_UNAVAILABLE` | Create could not start the Python interpreter that allocates the pseudo-terminal (`CLAUDE_MCP_PYTHON`). `cli` is `null`. |

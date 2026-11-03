@@ -37,6 +37,9 @@ describe("CLI prerequisites", () => {
       "API Error: 401 authentication_error: Authentication failed",
       'Please run `claude login`',
       '{\n  "loggedIn": false,\n  "authMethod": "none"\n}',
+      // Claude Code's cloud-create sign-in message, as reported live in #22.
+      "Cloud sessions need a claude.ai sign-in. Run `claude auth login` (or /login in a local session), then try again.",
+      "Your sign-in has expired.",
     ]) {
       assert.equal(isSignInError(text), true, text);
     }

@@ -53,24 +53,30 @@ async function connect(extraEnv: Record<string, string> = {}) {
     stderrText += chunk.toString("utf8");
   });
   await client.connect(transport);
-  const argvCalls = (): string[][] => {
+  // `auth status` calls are hidden by default: create and local runs make one as a sign-in
+  // preflight, which would shift every index. allArgvCalls / allMetaCalls keep them.
+  const isAuthStatus = (args: string[]) => args[0] === "auth" && args[1] === "status";
+  const allArgvCalls = (): string[][] => {
     try {
       return readFileSync(argvLog, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as string[]);
     } catch {
       return [];
     }
   };
-  const metaCalls = (): { cwd: string; pid: number; stdoutIsTTY: boolean; stdinIsTTY: boolean }[] => {
+  const argvCalls = (): string[][] => allArgvCalls().filter((args) => !isAuthStatus(args));
+  type Meta = { args: string[]; cwd: string; pid: number; stdoutIsTTY: boolean; stdinIsTTY: boolean };
+  const allMetaCalls = (): Meta[] => {
     try {
       return readFileSync(metaLog, "utf8")
         .trim()
         .split("\n")
         .filter(Boolean)
-        .map((l) => JSON.parse(l) as { cwd: string; pid: number; stdoutIsTTY: boolean; stdinIsTTY: boolean });
+        .map((l) => JSON.parse(l) as Meta);
     } catch {
       return [];
     }
   };
+  const metaCalls = (): Meta[] => allMetaCalls().filter((meta) => !isAuthStatus(meta.args));
   const stdinBytes = (): Buffer => {
     try {
       return readFileSync(stdinLog);
@@ -81,7 +87,9 @@ async function connect(extraEnv: Record<string, string> = {}) {
   return {
     client,
     argvCalls,
+    allArgvCalls,
     metaCalls,
+    allMetaCalls,
     stdinBytes,
     serverPid: transport.pid,
     stderr: () => stderrText,
@@ -300,7 +308,7 @@ describe("stdio smoke test", () => {
   });
 
   it("runs create on a pty and leaves follow-up and auth on pipes", async () => {
-    const { client, metaCalls, argvCalls, close } = await connect();
+    const { client, allMetaCalls, argvCalls, close } = await connect();
     try {
       await client.callTool({ name: "claude_create_cloud_session", arguments: { description: "$(rm -rf /) `id`" } });
       await client.callTool({
@@ -308,10 +316,14 @@ describe("stdio smoke test", () => {
         arguments: { session: "session_01Target00000000", message: "next" },
       });
       await client.callTool({ name: "claude_auth_status", arguments: {} });
-      const meta = metaCalls();
-      assert.equal(meta[0]?.stdoutIsTTY, true);
-      assert.equal(meta[1]?.stdoutIsTTY, false);
+      // The sign-in preflight, create, follow-up, then the claude_auth_status call.
+      const meta = allMetaCalls();
+      assert.deepEqual(meta[0]?.args, ["auth", "status"]);
+      assert.equal(meta[0]?.stdoutIsTTY, false);
+      assert.equal(meta[1]?.stdoutIsTTY, true);
       assert.equal(meta[2]?.stdoutIsTTY, false);
+      assert.deepEqual(meta[3]?.args, ["auth", "status"]);
+      assert.equal(meta[3]?.stdoutIsTTY, false);
       assert.deepEqual(argvCalls()[0], ["--cloud=$(rm -rf /) `id`"]);
     } finally {
       await close();
@@ -455,7 +467,10 @@ describe("stdio smoke test", () => {
   it("enforces CLAUDE_MCP_TIMEOUT_MS", async () => {
     const { client, close } = await connect({ FAKE_CLAUDE_MODE: "hang", CLAUDE_MCP_TIMEOUT_MS: "300" });
     try {
-      const result = (await client.callTool({ name: "claude_auth_status", arguments: {} })) as CallToolResult;
+      const result = (await client.callTool({
+        name: "claude_send_followup",
+        arguments: { session: "session_01FakeSessionId0000000000", message: "hangs" },
+      })) as CallToolResult;
       assert.equal(errorBody(result).error.code, "CLI_TIMEOUT");
     } finally {
       await close();
@@ -602,7 +617,7 @@ describe("stdio smoke test", () => {
     const home = join(tmp, "home-cwd");
     mkdirSync(work);
     mkdirSync(home);
-    const { client, metaCalls, close } = await connect({
+    const { client, allMetaCalls, close } = await connect({
       HOME: home,
       CLAUDE_MCP_CWD: work,
       CLAUDE_MCP_TRUST_CWD: "1",
@@ -620,9 +635,10 @@ describe("stdio smoke test", () => {
       assert.equal(s.parsed, true);
       assert.equal(s.title, "from cwd env");
       assert.doesNotMatch(s.cli.stdout, /[\u0000-\u0008\u000e-\u001f]/);
-      const meta = metaCalls();
-      assert.equal(meta[0]?.cwd, work);
-      assert.equal(meta[1]?.cwd, work);
+      // claude_auth_status, the create's sign-in preflight, then claude --cloud.
+      const meta = allMetaCalls();
+      assert.deepEqual(meta.map((m) => m.args[0]), ["auth", "auth", "--cloud=from cwd env"]);
+      for (const m of meta) assert.equal(m.cwd, work);
       const saved = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")) as {
         projects: Record<string, { hasTrustDialogAccepted?: boolean }>;
       };
@@ -1426,6 +1442,105 @@ describe("claude_run_local", () => {
       assert.equal((read.structuredContent as { local_job: LocalJobBody }).local_job.status, "cancelled");
     } finally {
       await close();
+    }
+  });
+});
+
+describe("trust prompt and sign-in preflight (#21, #22)", () => {
+  it("refuses the Claude Code 2.1.316 trust dialog in seconds instead of waiting for the timeout", async () => {
+    const { client, stdinBytes, close } = await connect({
+      FAKE_CLAUDE_TRUST: "prompt",
+      FAKE_CLAUDE_TRUST_LAYOUT: "2.1.316",
+      CLAUDE_MCP_TIMEOUT_MS: "600000",
+    });
+    try {
+      const started = Date.now();
+      const result = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "untrusted folder" },
+      })) as CallToolResult;
+      const error = errorBody(result).error;
+      assert.equal(error.code, "WORKSPACE_NOT_TRUSTED");
+      assert.match(error.message, /CLAUDE_MCP_TRUST_CWD=1/);
+      assert.ok(Date.now() - started < 10_000, "fails fast");
+      assert.equal(stdinBytes().length, 0, "the dialog is not answered");
+    } finally {
+      await close();
+    }
+  });
+
+  it("with CLAUDE_MCP_TRUST_CWD, moves to Yes before pressing Enter on the 2.1.316 dialog", async () => {
+    const home = join(tmp, "home-trust-316");
+    mkdirSync(home);
+    const { client, stdinBytes, close } = await connect({
+      HOME: home,
+      CLAUDE_MCP_TRUST_CWD: "1",
+      FAKE_CLAUDE_TRUST: "prompt",
+      FAKE_CLAUDE_TRUST_LAYOUT: "2.1.316",
+    });
+    try {
+      const result = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "trusted by keystroke" },
+      })) as CallToolResult;
+      assert.notEqual(result.isError, true, JSON.stringify(result.content));
+      assert.equal((result.structuredContent as { parsed: boolean }).parsed, true);
+      assert.equal(stdinBytes().toString("utf8"), "\u001b[B\r", "down arrow, then Enter");
+    } finally {
+      await close();
+    }
+  });
+
+  it("fails create and local runs with CLI_NOT_SIGNED_IN before starting them when auth status says signed out", async () => {
+    const localRoot = join(tmp, "preflight-local");
+    mkdirSync(localRoot, { recursive: true });
+    const { client, allArgvCalls, close } = await connect({ FAKE_AUTH_STATUS: "out", CLAUDE_MCP_LOCAL_ROOTS: localRoot });
+    try {
+      const started = Date.now();
+      const created = (await client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "signed out" },
+      })) as CallToolResult;
+      const error = errorBody(created).error;
+      assert.equal(error.code, "CLI_NOT_SIGNED_IN");
+      assert.match(error.message, /loggedIn false \(auth method: claude\.ai\)/);
+      assert.match(error.message, /claude auth login/);
+      assert.ok(Date.now() - started < 5_000);
+      const local = (await client.callTool({
+        name: "claude_run_local",
+        arguments: { cwd: localRoot, prompt: "signed out" },
+      })) as CallToolResult;
+      assert.equal(errorBody(local).error.code, "CLI_NOT_SIGNED_IN");
+      assert.deepEqual(allArgvCalls(), [
+        ["auth", "status"],
+        ["auth", "status"],
+      ], "neither --cloud nor -p ran");
+    } finally {
+      await close();
+    }
+  });
+
+  it("checks sign-in once a minute, and lets work go ahead when auth status can't be read", async () => {
+    const ok = await connect();
+    try {
+      for (const description of ["first", "second"]) {
+        const result = (await ok.client.callTool({ name: "claude_create_cloud_session", arguments: { description } })) as CallToolResult;
+        assert.notEqual(result.isError, true);
+      }
+      assert.deepEqual(ok.allArgvCalls(), [["auth", "status"], ["--cloud=first"], ["--cloud=second"]]);
+    } finally {
+      await ok.close();
+    }
+    const garbled = await connect({ FAKE_AUTH_STATUS: "garbled" });
+    try {
+      const result = (await garbled.client.callTool({
+        name: "claude_create_cloud_session",
+        arguments: { description: "auth unreadable" },
+      })) as CallToolResult;
+      assert.notEqual(result.isError, true);
+      assert.deepEqual(garbled.argvCalls(), [["--cloud=auth unreadable"]]);
+    } finally {
+      await garbled.close();
     }
   });
 });

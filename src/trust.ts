@@ -17,17 +17,74 @@ export class TrustFileError extends Error {
 }
 
 /**
+ * The dialog's question in the wordings Claude Code has used: "Do you trust
+ * the files in this folder?" and, by 2.1.316, "Quick safety check: Is this a
+ * project you created or one you trust?". Words may be separated by any
+ * whitespace, since the dialog wraps at the terminal width.
+ */
+const TRUST_QUESTIONS = [
+  /Do\s+you\s+trust\s+(?:the\s+files\s+in\s+)?this\s+folder\?/,
+  /Is\s+this\s+a\s+project\s+you\s+created\s+or\s+one\s+you\s+trust\?/,
+];
+
+/** The dialog's accept option. */
+const TRUST_YES = /Yes,\s+I\s+trust\s+this\s+folder/;
+
+/** Lines of `output` with the task title line (`Created cloud session: …`) removed. */
+function dialogLines(output: string): string[] {
+  return cleanTerminalText(output)
+    .split("\n")
+    .filter((line) => !/^\s*Created cloud session:/.test(line));
+}
+
+/**
  * True when Claude Code's workspace-trust dialog is on screen.
- * The task title line (`Created cloud session: …`) is ignored so a
- * description that happens to contain the question is not treated as the dialog.
+ * The task title line is ignored so a description that happens to contain
+ * the question is not treated as the dialog.
  */
 export function isTrustPrompt(output: string): boolean {
-  const text = cleanTerminalText(output);
-  const body = text
-    .split("\n")
-    .filter((line) => !/^\s*Created cloud session:/.test(line))
-    .join("\n");
-  return /Do you trust (?:the files in )?this folder\?/.test(body);
+  const body = dialogLines(output).join("\n");
+  return TRUST_QUESTIONS.some((question) => question.test(body)) || TRUST_YES.test(body);
+}
+
+/** True once the dialog's accept option has been drawn. */
+export function isTrustMenuDrawn(output: string): boolean {
+  return TRUST_YES.test(dialogLines(output).join("\n"));
+}
+
+/** Keys that move a menu selection down or up one row. */
+export const KEY_DOWN = "\u001b[B";
+export const KEY_UP = "\u001b[A";
+
+/**
+ * Keystrokes that choose "Yes, I trust this folder" in the dialog on screen,
+ * or null when the menu can't be read. The selected row carries `❯`. Claude
+ * Code 2.1.316 lists "No, exit" first and selects it, so Enter alone would
+ * exit; older versions selected "1. Yes, I trust this folder".
+ */
+export function trustAnswerKeys(output: string): string[] | null {
+  const lines = dialogLines(output);
+  // Only the last drawing of the menu counts: the UI redraws the dialog in place.
+  let yes = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (TRUST_YES.test(lines[i] ?? "")) {
+      yes = i;
+      break;
+    }
+  }
+  if (yes === -1) return null;
+  const start = Math.max(0, yes - 4);
+  const menu = lines.slice(start, yes + 5);
+  const selected = menu.findIndex((line) => /^\s*❯/.test(line));
+  if (selected === -1) return null;
+  const options = menu
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => /^\s*(?:❯\s*)?(?:\d+\.\s*)?(?:Yes,\s+I\s+trust\s+this\s+folder|No,\s+exit)\b/.test(line));
+  const from = options.findIndex(({ index }) => index === selected);
+  const to = options.findIndex(({ line }) => TRUST_YES.test(line));
+  if (from === -1 || to === -1) return null;
+  const moves = Array.from({ length: Math.abs(to - from) }, () => (to > from ? KEY_DOWN : KEY_UP));
+  return [...moves, "\r"];
 }
 
 /**

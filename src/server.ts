@@ -56,7 +56,14 @@ import {
   type CreatePlan,
   type GithubRepo,
 } from "./repos.js";
-import { claudeJsonPath, ensureWorkspaceTrusted, isTrustPrompt, resolveTrustProjectPath } from "./trust.js";
+import {
+  claudeJsonPath,
+  ensureWorkspaceTrusted,
+  isTrustMenuDrawn,
+  isTrustPrompt,
+  resolveTrustProjectPath,
+  trustAnswerKeys,
+} from "./trust.js";
 
 export const SERVER_NAME = "claude-code-mcp-server";
 export const SERVER_VERSION = "0.1.1";
@@ -95,6 +102,10 @@ const CREATE_WAIT_MS = 2_000;
 const OUTPUT_TAIL_CHARS = 4_000;
 /** Raw CLI output kept per job, to bound memory. Mirrors the pty cap. */
 const MAX_JOB_OUTPUT_CHARS = 4 * 1024 * 1024;
+/** How long a signed-in `claude auth status` result is trusted before create and local runs check again. */
+const AUTH_OK_CACHE_MS = 60_000;
+/** Most time the sign-in preflight may take before the run goes ahead without it. */
+const AUTH_PREFLIGHT_TIMEOUT_MS = 10_000;
 /** Changed files a local run reports. */
 const MAX_LOCAL_FILES = 1_000;
 
@@ -477,6 +488,46 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: SERVER_INSTRUCTIONS });
   const jobs = new JobStore<CreateJob>();
   const localJobs = new JobStore<LocalJob>();
+  let authOkAt: number | null = null;
+
+  /**
+   * Before create or a local run starts anything else, check the sign-in
+   * with `claude auth status`: a signed-out CLI fails in about a second with
+   * CLI_NOT_SIGNED_IN instead of partway through. A missing CLI fails with
+   * CLI_NOT_FOUND. Anything else this check can't read lets the run go
+   * ahead, so the CLI's own error still surfaces.
+   */
+  async function authPreflight(): Promise<CallToolResult | null> {
+    if (authOkAt !== null && Date.now() - authOkAt < AUTH_OK_CACHE_MS) return null;
+    const args = authStatusArgv();
+    let result: RunResult;
+    try {
+      result = await runner(config.claudeBin, args, Math.min(config.timeoutMs, AUTH_PREFLIGHT_TIMEOUT_MS), config.cwd);
+    } catch (err) {
+      if (err instanceof RunError && err.code === "CLI_NOT_FOUND") return toolError(err.code, err.message, args);
+      return null;
+    }
+    if (result.timedOut) return null;
+    let status;
+    try {
+      status = parseAuthStatus(result.stdout);
+    } catch {
+      return null;
+    }
+    if (status.loggedIn) {
+      authOkAt = Date.now();
+      return null;
+    }
+    authOkAt = null;
+    const how = status.authMethod === null ? "" : ` (auth method: ${status.authMethod})`;
+    return toolError(
+      "CLI_NOT_SIGNED_IN",
+      signInMessage(`claude auth status reports loggedIn false${how}`) +
+        " On a headless host, run `claude auth login` there. On macOS over SSH, the login keychain may be locked; unlock it or run the server in the logged-in user's session.",
+      args,
+      result,
+    );
+  }
 
   /** Runs the CLI; returns the result on exit 0, otherwise a tool error. */
   async function run(args: string[]): Promise<RunResult | CallToolResult> {
@@ -517,7 +568,11 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
         onProgress,
         onOutput: (output) => {
           if (!isTrustPrompt(output)) return "wait";
-          return config.trustCwd ? "accept" : "refuse";
+          if (!config.trustCwd) return "refuse";
+          // Never press Enter blind: wait for the menu to be drawn, then refuse if its selection can't be read.
+          const keys = trustAnswerKeys(output);
+          if (keys !== null) return { keys };
+          return isTrustMenuDrawn(output) ? "refuse" : "wait";
         },
       });
     } catch (err) {
@@ -525,7 +580,7 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
       throw err;
     }
     if (result.trustPrompt === "refused" || (result.trustPrompt !== "accepted" && isTrustPrompt(result.stdout))) {
-      return toolError("WORKSPACE_NOT_TRUSTED", trustMessage(projectPath), args, result);
+      return toolError("WORKSPACE_NOT_TRUSTED", trustMessage(projectPath, config.trustCwd), args, result);
     }
     if (result.timedOut) {
       return toolError("CLI_TIMEOUT", `claude timed out after ${limits.timeoutMs} ms`, args, result);
@@ -616,6 +671,8 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
 
   /** Clone (for GitHub), then run `claude --cloud`. Settles with the final tool result. */
   async function runCreateJob(job: Job<CreateJob>, plan: CreatePlan): Promise<CallToolResult> {
+    const signedOut = await authPreflight();
+    if (signedOut !== null) return signedOut;
     try {
       if (plan.kind === "github") {
         const github = plan.github;
@@ -1073,6 +1130,8 @@ export function createServer(config: Config, runner: Runner = runCli): McpServer
   /** Run `claude -p` and read its result. Settles with the final tool result. */
   async function runLocalJob(job: Job<LocalJob>): Promise<CallToolResult> {
     const { args, cwd, timeoutMs, parser } = job.details;
+    const signedOut = await authPreflight();
+    if (signedOut !== null) return signedOut;
     const before = await readGitStatus(cwd, timeoutMs);
     let result: RunResult;
     try {
@@ -1253,8 +1312,16 @@ function changedFiles(before: string | null, after: string | null): LocalBody["f
 
 // ---- result helpers ------------------------------------------------------
 
-function trustMessage(projectPath: string): string {
+function trustMessage(projectPath: string, trustCwd: boolean): string {
   const shown = JSON.stringify(projectPath);
+  if (trustCwd) {
+    return (
+      `Claude Code asked to trust ${projectPath} before creating a cloud session. CLAUDE_MCP_TRUST_CWD is set, ` +
+      `but this server could not read which option the dialog had selected, so it did not answer it. ` +
+      `Trust the folder by accepting the dialog in an interactive claude session there, or set ` +
+      `projects[${shown}].hasTrustDialogAccepted to true in ~/.claude.json, then try again.`
+    );
+  }
   return (
     `Claude Code asked to trust ${projectPath} before creating a cloud session. ` +
     `Set CLAUDE_MCP_TRUST_CWD=1 to let this server accept that dialog for the directory this session is created from ` +

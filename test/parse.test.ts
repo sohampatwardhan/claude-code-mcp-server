@@ -279,6 +279,17 @@ describe("stripAnsi", () => {
   it("removes SGR and OSC sequences", () => {
     assert.equal(stripAnsi("\u001b[31mred\u001b[0m \u001b]8;;https://x\u0007link\u001b]8;;\u0007"), "red link");
   });
+
+  it("turns cursor moves into the spaces they leave, as Claude Code 2.1.316 draws words", () => {
+    assert.equal(stripAnsi("\u001b[2GQuick\u001b[8Gsafety\u001b[15Gcheck:"), " Quick safety check:");
+    assert.equal(stripAnsi("Run\u001b[1C`claude\u001b[2Cauth`"), "Run `claude  auth`");
+    // A move to a column already passed, or to the current one, adds nothing.
+    assert.equal(stripAnsi("abcdef\u001b[3Gxy"), "abcdefxy");
+    assert.equal(stripAnsi("abcd\u001b[5Gef"), "abcdef");
+    // Columns restart after each line break, and other escapes take no width.
+    assert.equal(stripAnsi("ab\r\r\n\u001b[1m\u001b[3Gcd\u001b[22m"), "ab\r\r\n  cd");
+    assert.equal(stripAnsi("x\u001b[99999Gy").length, 500, "a move is capped at column 500");
+  });
 });
 
 describe("LocalStreamParser", () => {
