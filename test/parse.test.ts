@@ -12,6 +12,7 @@ import {
   parseFollowupOutput,
   parseGitStatusZ,
   parseTeleportOutput,
+  parseUsageReport,
   stripAnsi,
 } from "../src/parse.js";
 
@@ -399,5 +400,71 @@ describe("parseGitStatusZ", () => {
   it("returns no entries for a clean tree and skips malformed fields", () => {
     assert.deepEqual(parseGitStatusZ(""), []);
     assert.deepEqual(parseGitStatusZ("XY\0garbage\0"), []);
+  });
+});
+
+describe("parseUsageReport", () => {
+  // Shaped like Claude Code 2.1.316's `claude -p --restricted --output-format=stream-json --verbose -- /usage`.
+  const init = JSON.stringify({ type: "system", subtype: "init", session_id: "33333333-4444-4555-8666-777777777777" });
+  const report = (rateLimits: unknown) =>
+    JSON.stringify({
+      type: "assistant",
+      parent_tool_use_id: null,
+      local_command_source: "<local-command-stdout>Current session: 68% used · resets Nov 2 at 5:10pm\n\nLast 24h · 1390 requests</local-command-stdout>",
+      local_command_run: true,
+      message: { role: "assistant", content: [{ type: "text", text: "Current session: 68% used" }] },
+      usage_report: {
+        session: { total_cost_usd: 0, total_api_duration_ms: 0, total_duration_ms: 0, total_lines_added: 0, total_lines_removed: 0, model_usage: {} },
+        rate_limits: rateLimits,
+      },
+    });
+  const result = JSON.stringify({ type: "result", subtype: "success", is_error: false, local_command: "usage", num_turns: 0, total_cost_usd: 0 });
+
+  it("reads each window and the usage-credit block", () => {
+    const text = [
+      init,
+      report({
+        limits: [
+          { kind: "session", group: "session", percent: 68, resets_at: "2026-11-02T22:10:00.474794+00:00", scope: null, severity: "normal", is_active: true },
+          {
+            kind: "weekly_scoped",
+            group: "weekly",
+            percent: 0,
+            resets_at: "2026-11-02T21:00:00+00:00",
+            scope: { model: null, surface: { display_name: "Cowork" } },
+            severity: "normal",
+            is_active: false,
+          },
+          { kind: "weekly_scoped", group: "weekly", percent: 41.5, resets_at: null, scope: { model: { display_name: "Opus" } }, severity: "warning", is_active: false },
+          { kind: "broken", percent: "lots" },
+        ],
+        extra_usage: { is_enabled: true, monthly_limit: 5000, used_credits: 1200, utilization: 24, currency: "USD" },
+      }),
+      result,
+    ].join("\n");
+    assert.deepEqual(parseUsageReport(text), {
+      parsed: true,
+      windows: [
+        { kind: "session", group: "session", percent: 68, resets_at: "2026-11-02T22:10:00.474794+00:00", severity: "normal", is_active: true, scope: null },
+        { kind: "weekly_scoped", group: "weekly", percent: 0, resets_at: "2026-11-02T21:00:00+00:00", severity: "normal", is_active: false, scope: "Cowork" },
+        { kind: "weekly_scoped", group: "weekly", percent: 41.5, resets_at: null, severity: "warning", is_active: false, scope: "Opus" },
+      ],
+      extra_usage: { is_enabled: true, monthly_limit: 5000, used_credits: 1200, utilization: 24, currency: "USD" },
+    });
+  });
+
+  it("reports windows null when the CLI can't read plan usage, and parsed false with no report", () => {
+    assert.deepEqual(parseUsageReport([init, report(null), result].join("\n")), { parsed: true, windows: null, extra_usage: null });
+    assert.deepEqual(parseUsageReport([init, result, "not json {", ""].join("\n")), { parsed: false, windows: null, extra_usage: null });
+  });
+});
+
+describe("LocalStreamParser rate limits", () => {
+  it("keeps the latest rate_limit_event, in either field spelling", () => {
+    const parser = new LocalStreamParser();
+    parser.push(JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", resetsAt: 1793743800, utilization: 0.91 } }) + "\n");
+    assert.deepEqual(parser.rateLimit, { status: "allowed_warning", resets_at: 1793743800, utilization: 0.91, type: null });
+    parser.push(JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "rejected", resets_at: 1793750000, rate_limit_type: "five_hour" } }) + "\n");
+    assert.deepEqual(parser.rateLimit, { status: "rejected", resets_at: 1793750000, utilization: null, type: "five_hour" });
   });
 });

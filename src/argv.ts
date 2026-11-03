@@ -137,6 +137,15 @@ export function localRunArgv(options: LocalRunOptions): string[] {
 }
 
 /**
+ * Print-mode `/usage` for `claude_usage`. `/usage` is a local command: the
+ * CLI reads the plan's usage and runs no model turn, so this costs nothing.
+ * Restricted, with no MCP servers, so no hooks or settings run either.
+ */
+export function usageArgv(): string[] {
+  return assertLocal(["-p", "--restricted", "--strict-mcp-config", "--output-format=stream-json", "--verbose", "--", "/usage"]);
+}
+
+/**
  * Invariant: a local run is print mode and never a cloud, teleport, or
  * permission-skipping invocation. Everything before `--` is a flag this
  * module built.

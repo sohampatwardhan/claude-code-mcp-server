@@ -349,6 +349,8 @@ export class LocalStreamParser {
   sessionId: string | null = null;
   assistantMessages = 0;
   result: LocalResult | null = null;
+  /** The latest `rate_limit_event` the run reported. */
+  rateLimit: LocalRateLimit | null = null;
   private partial = "";
   private skipping = false;
 
@@ -394,8 +396,30 @@ export class LocalStreamParser {
       if (this.sessionId === null || value.type === "result") this.sessionId = sessionId;
     }
     if (value.type === "assistant") this.assistantMessages++;
+    if (value.type === "rate_limit_event" && isRecord(value.rate_limit_info)) this.rateLimit = rateLimit(value.rate_limit_info);
     if (value.type === "result") this.result = localResult(value);
   }
+}
+
+/** Rate-limit state from a run's `rate_limit_event`. */
+export interface LocalRateLimit {
+  /** `allowed`, `allowed_warning` (approaching the limit) or `rejected` (limit hit). */
+  status: string | null;
+  /** Unix seconds when the window resets. */
+  resets_at: number | null;
+  /** Fraction of the window used, 0-1. */
+  utilization: number | null;
+  /** Which window, such as `five_hour` or `seven_day`, when the CLI says. */
+  type: string | null;
+}
+
+function rateLimit(info: Record<string, unknown>): LocalRateLimit {
+  return {
+    status: stringField(info, "status"),
+    resets_at: finiteField(info, "resetsAt") ?? finiteField(info, "resets_at"),
+    utilization: finiteField(info, "utilization"),
+    type: stringField(info, "rateLimitType") ?? stringField(info, "rate_limit_type"),
+  };
 }
 
 function localResult(value: Record<string, unknown>): LocalResult {
@@ -454,4 +478,97 @@ export function parseGitStatusZ(text: string): GitStatusEntry[] {
     entries.push({ status, path, from });
   }
   return entries;
+}
+
+// ---- plan usage (`claude -p -- /usage`) ----------------------------------
+
+export interface UsageWindow {
+  /** The server's meter kind, such as `session`, `weekly_all`, or `weekly_scoped`. */
+  kind: string;
+  group: string | null;
+  /** Share of the window used, 0-100 (above 100 past the limit). */
+  percent: number;
+  /** ISO 8601 time the window resets. */
+  resets_at: string | null;
+  severity: string | null;
+  is_active: boolean;
+  /** Display name of the model or surface a scoped window applies to. */
+  scope: string | null;
+}
+
+export interface UsageExtra {
+  is_enabled: boolean;
+  monthly_limit: number | null;
+  used_credits: number | null;
+  utilization: number | null;
+  currency: string | null;
+}
+
+export interface ParsedUsage {
+  /** True when a `usage_report` line was found. */
+  parsed: boolean;
+  /** Null when the CLI could not read the plan's usage (for example, a token without that scope). */
+  windows: UsageWindow[] | null;
+  extra_usage: UsageExtra | null;
+}
+
+/**
+ * Read the structured `usage_report` from `/usage` stream-json. Only the
+ * meters are kept: the report's text and local activity summary are not.
+ * Never throws.
+ */
+export function parseUsageReport(stdout: string): ParsedUsage {
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{") || !trimmed.includes('"usage_report"')) continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!isRecord(value) || !isRecord(value.usage_report)) continue;
+    const limits = isRecord(value.usage_report.rate_limits) ? value.usage_report.rate_limits : null;
+    if (limits === null) return { parsed: true, windows: null, extra_usage: null };
+    const rows = Array.isArray(limits.limits) ? limits.limits : [];
+    const windows: UsageWindow[] = [];
+    for (const row of rows.slice(0, 50)) {
+      if (!isRecord(row)) continue;
+      const kind = stringField(row, "kind");
+      const percent = row.percent;
+      if (kind === null || typeof percent !== "number" || !Number.isFinite(percent)) continue;
+      const scope = isRecord(row.scope) ? row.scope : null;
+      const scopeOwner = scope === null ? null : isRecord(scope.model) ? scope.model : isRecord(scope.surface) ? scope.surface : null;
+      windows.push({
+        kind,
+        group: stringField(row, "group"),
+        percent,
+        resets_at: stringField(row, "resets_at"),
+        severity: stringField(row, "severity"),
+        is_active: row.is_active === true,
+        scope: scopeOwner === null ? null : stringField(scopeOwner, "display_name"),
+      });
+    }
+    const extra = isRecord(limits.extra_usage) ? limits.extra_usage : null;
+    return {
+      parsed: true,
+      windows,
+      extra_usage:
+        extra === null
+          ? null
+          : {
+              is_enabled: extra.is_enabled === true,
+              monthly_limit: finiteField(extra, "monthly_limit"),
+              used_credits: finiteField(extra, "used_credits"),
+              utilization: finiteField(extra, "utilization"),
+              currency: stringField(extra, "currency"),
+            },
+    };
+  }
+  return { parsed: false, windows: null, extra_usage: null };
+}
+
+function finiteField(obj: Record<string, unknown>, key: string): number | null {
+  const v = obj[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
 }

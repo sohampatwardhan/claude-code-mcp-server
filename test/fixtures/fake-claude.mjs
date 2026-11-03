@@ -39,6 +39,11 @@
 //                          init and never exits; "no_result" exits 1 with stderr only
 //   FAKE_LOCAL_DELAY_MS    a local run waits this long before its result
 //   FAKE_LOCAL_WRITE       a local run writes this file (relative to cwd) before its result
+//   FAKE_LOCAL_RATE_LIMIT  a local run emits a rate_limit_event with this status first
+//   FAKE_USAGE_MODE        `-p -- /usage`: unset prints a usage_report; "null" reports
+//                          rate_limits null; "fail" exits 1; "garbled" prints no report
+//   FAKE_USAGE_SESSION_PERCENT / FAKE_USAGE_WEEKLY_PERCENT
+//                          percents in that report (default 68 and 10)
 //
 // Creating a session (`--cloud=<description>` without `-p`) requires a TTY,
 // matching Claude Code: a piped stdout exits 3 with the interactive-terminal error.
@@ -138,6 +143,8 @@ if (mode === "hang" && !(args[0] === "auth" && args[1] === "status")) {
   }
 } else if (args[0]?.startsWith("--teleport=")) {
   handleTeleport(args[0].slice("--teleport=".length));
+} else if (args[0] === "-p" && args.includes("--output-format=stream-json") && args[args.indexOf("--") + 1] === "/usage") {
+  handleUsage();
 } else if (args[0] === "-p" && args.includes("--output-format=stream-json")) {
   handleLocal();
 } else {
@@ -229,6 +236,71 @@ function fileTrusted() {
   return false;
 }
 
+function handleUsage() {
+  const usageMode = process.env.FAKE_USAGE_MODE ?? "ok";
+  const session = "33333333-4444-4555-8666-777777777777";
+  const write = (value, done) => process.stdout.write(JSON.stringify(value) + "\n", done);
+  if (usageMode === "fail") {
+    process.stderr.write("Error: could not load usage\n");
+    process.exit(1);
+  }
+  write({ type: "system", subtype: "init", session_id: session, cwd: process.cwd(), tools: [] });
+  if (usageMode === "garbled") {
+    write({ type: "result", subtype: "success", is_error: false, result: "?", local_command: "usage", num_turns: 0, session_id: session }, () => process.exit(0));
+    return;
+  }
+  const rateLimits =
+    usageMode === "null"
+      ? null
+      : {
+          limits: [
+            {
+              kind: "session",
+              group: "session",
+              percent: Number(process.env.FAKE_USAGE_SESSION_PERCENT ?? "68"),
+              resets_at: "2026-11-02T22:10:00.474794+00:00",
+              scope: null,
+              severity: "normal",
+              is_active: true,
+            },
+            {
+              kind: "weekly_all",
+              group: "weekly",
+              percent: Number(process.env.FAKE_USAGE_WEEKLY_PERCENT ?? "10"),
+              resets_at: "2026-11-06T21:00:00+00:00",
+              scope: null,
+              severity: "normal",
+              is_active: false,
+            },
+            {
+              kind: "weekly_scoped",
+              group: "weekly",
+              percent: 99,
+              resets_at: "2026-11-02T21:00:00+00:00",
+              scope: { model: null, surface: { display_name: "Cowork" } },
+              severity: "critical",
+              is_active: false,
+            },
+          ],
+          extra_usage: { is_enabled: false, monthly_limit: null, used_credits: null, utilization: null, currency: null },
+        };
+  write({
+    type: "assistant",
+    session_id: session,
+    local_command_run: true,
+    local_command_source: "<local-command-stdout>Current session: 68% used · Last 24h · 1390 requests</local-command-stdout>",
+    message: { role: "assistant", content: [{ type: "text", text: "Current session: 68% used" }] },
+    usage_report: {
+      session: { total_cost_usd: 0, total_api_duration_ms: 0, total_duration_ms: 0, total_lines_added: 0, total_lines_removed: 0, model_usage: {} },
+      rate_limits: rateLimits,
+    },
+  });
+  write(
+    { type: "result", subtype: "success", is_error: false, result: "Current session: 68% used", local_command: "usage", num_turns: 0, total_cost_usd: 0, session_id: session },
+    () => process.exit(0),
+  );
+}
+
 function handleLocal() {
   const localMode = process.env.FAKE_LOCAL_MODE ?? "ok";
   const resume = args.find((arg) => arg.startsWith("--resume="));
@@ -240,6 +312,14 @@ function handleLocal() {
     process.exit(1);
   }
   emit({ type: "system", subtype: "init", session_id: session, cwd: process.cwd(), tools: ["Read", "Edit", "Bash"] });
+  if (process.env.FAKE_LOCAL_RATE_LIMIT) {
+    emit({
+      type: "rate_limit_event",
+      session_id: session,
+      uuid: "44444444-5555-4666-8777-888888888888",
+      rate_limit_info: { status: process.env.FAKE_LOCAL_RATE_LIMIT, resetsAt: 1793743800, utilization: 0.91 },
+    });
+  }
   if (localMode === "hang") {
     setInterval(() => {}, 1_000);
     return;
