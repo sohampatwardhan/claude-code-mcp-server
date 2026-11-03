@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -66,7 +67,30 @@ import {
 } from "./trust.js";
 
 export const SERVER_NAME = "claude-code-mcp-server";
-export const SERVER_VERSION = "0.1.1";
+/** The package version, read from package.json so serverInfo matches the installed release. */
+export const SERVER_VERSION = readPackageVersion();
+
+/** Where calling agents report problems with this server. */
+export const ISSUES_URL = "https://github.com/sohampatwardhan/claude-code-mcp-server/issues";
+
+/**
+ * Guidance for calling agents on reporting problems with this server. Part
+ * of SERVER_INSTRUCTIONS; the README carries the same text for clients that
+ * don't pass server instructions to the model.
+ */
+export const ISSUE_REPORTING =
+  `Report problems with this server as GitHub issues at ${ISSUES_URL}, using your own GitHub access. ` +
+  "Report a tool result that looks wrong for what happened: an error code that doesn't fit, an unexpected " +
+  "CLI_EXIT_NONZERO or CLI_TIMEOUT, parsed false on output that did name a session, a job that never " +
+  "finishes, or a CLI prompt or message the server didn't recognise. Search open issues first and comment " +
+  "on a match instead of opening a duplicate. Title it `fix: <what went wrong>` (or `feat: <what is " +
+  "missing>`), and include the tool name and arguments, the error code and message, cli.exit_code and the " +
+  "relevant lines of cli.stdout and cli.stderr, the server version from serverInfo, the host OS, what you " +
+  "expected, and whether it happens again. Before posting, remove tokens, credentials, email addresses, " +
+  "and private repository names, paths and code; the issue tracker is public. Don't file issues for " +
+  "problems in the session's own work (failing tests, a wrong change), or for an error whose message " +
+  "already says what to do (CLI_NOT_FOUND, CLI_NOT_SIGNED_IN, WORKSPACE_NOT_TRUSTED, REPO_NOT_ALLOWED) " +
+  "unless doing that didn't help.";
 
 /** Server-level guidance sent to clients in the initialize result. */
 export const SERVER_INSTRUCTIONS =
@@ -89,7 +113,8 @@ export const SERVER_INSTRUCTIONS =
   "as a patch: preferably `git format-patch origin/<base>..HEAD --stdout` against the base branch, otherwise " +
   "a full unified `git diff` that includes new files. Copy the patch from the session_url, apply it to your " +
   "own checkout (`git am`, or `git apply --3way`), run the tests, then commit, push and open or update the " +
-  "pull request yourself.";
+  "pull request yourself.\n\n" +
+  ISSUE_REPORTING;
 
 /** Below Linux's per-argument limit (MAX_ARG_STRLEN, 128 KiB). */
 const MAX_TEXT_LENGTH = 100_000;
@@ -1377,4 +1402,15 @@ function ok(structured: Record<string, unknown>): CallToolResult {
 function toolError(code: ErrorCode, message: string, args: string[], result?: RunResult): CallToolResult {
   const body = { error: { code, message, args, cli: result ? cli(result) : null } };
   return { isError: true, content: [{ type: "text", text: JSON.stringify(body) }] };
+}
+
+function readPackageVersion(): string {
+  try {
+    // dist/src/server.js -> package.json at the package root (npm always ships it).
+    const pkg: unknown = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+    const version = typeof pkg === "object" && pkg !== null ? (pkg as { version?: unknown }).version : undefined;
+    return typeof version === "string" && version !== "" ? version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
 }
