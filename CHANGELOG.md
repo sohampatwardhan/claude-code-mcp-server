@@ -10,6 +10,7 @@
 
 ### Added
 
+- New `claude_usage` tool reports the Claude plan's usage allowance (session and weekly windows with percent and reset time, plus usage-credit spend) from print-mode `/usage`, which runs no model turn and costs nothing. Readings are cached for 60 s. `CLAUDE_MCP_USAGE_STOP_PERCENT` makes create and `claude_run_local` refuse with the new `USAGE_LIMIT_NEAR` error near the limit. Local runs report the CLI's rate-limit events in `rate_limit`.
 - `claude_create_cloud_session` runs in the background and returns within about 2 seconds, so a slow clone or `claude --cloud` on a large repository no longer hits the MCP client's request timeout (`-32001`). The output gains `job_id`, `status` (`cloning`, `starting`, `running`, `done`) and `elapsed_ms`. When `status` is not `done`, poll `claude_get_session` with the `job_id`.
 - `claude_get_session` accepts a `job_id` and returns that create's progress or result in `job`, or its error. `session_id`, `repo` and `cli` in its output are now nullable.
 - Server instructions ask calling agents (Muse, Grok Bot and others) to report problems with the server as GitHub issues on this repository: what to include, what to strip, and what not to report. The README has the same text for clients that don't pass server instructions on.
