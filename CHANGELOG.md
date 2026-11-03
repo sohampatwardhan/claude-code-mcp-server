@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
+
+Changes since 0.1.1. 0.1.2 and 0.1.3 changed only packaging, CI and tests (version sync, macOS path tests, a GitHub Packages mirror, the npm `bin` path). Fixes first, per the release rule in AGENTS.md.
+
+### Changed (check your client)
+
+- `claude_create_cloud_session` returns within about 2 seconds. When `status` isn't `done`, poll `claude_get_session` with the returned `job_id` for the session; a client that expected `session_id` in the create result every time has to handle this.
+- `session_id`, `repo` and `cli` in `claude_get_session` output can be `null` (for job reads), and it gains `job` and `local_job`.
+- Create and `claude_run_local` first run `claude auth status` (no model call), so a signed-out CLI now fails fast with `CLI_NOT_SIGNED_IN`.
+- The server reports its real version in `serverInfo` (it said `0.1.1`).
 
 ### Fixed
 
