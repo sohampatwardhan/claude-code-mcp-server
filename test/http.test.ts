@@ -264,6 +264,29 @@ describe("Streamable HTTP transport", () => {
     }
   });
 
+  it("shares the usage and sign-in caches across connections, as stdio does", async () => {
+    const server = await start();
+    try {
+      for (const expectCached of [false, true]) {
+        const client = await connectClient(server.url);
+        const usage = (await client.callTool({ name: "claude_usage", arguments: {} })) as CallToolResult;
+        assert.notEqual(usage.isError, true);
+        assert.equal((usage.structuredContent as { cached: boolean }).cached, expectCached);
+        await client.close();
+      }
+      assert.equal(server.argvCalls().filter((args) => args.includes("/usage")).length, 1, "one /usage run for both connections");
+      for (const description of ["first", "second"]) {
+        const client = await connectClient(server.url);
+        await client.callTool({ name: "claude_create_cloud_session", arguments: { description } });
+        await client.close();
+      }
+      const authRuns = server.argvCalls().filter((args) => args[0] === "auth" && args[1] === "status").length;
+      assert.equal(authRuns, 1, "the sign-in preflight is reused across connections");
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("stops every child it started when it gets SIGTERM", async () => {
     const server = await start({ FAKE_CLAUDE_MODE: "hang" });
     try {
